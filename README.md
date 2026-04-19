@@ -8,17 +8,85 @@ DTM-333, HTM-121, etc. — slot in without rewriting the core.
 
 ## Install
 
-```bash
-# core package + pyserial for real hardware
-pip install "group3lib[serial]"
-
-# dev setup (ruff + mypy + pytest)
-pip install -e ".[all]"
-```
-
 Python 3.10 or later. The core package has **no required runtime dependencies** —
 `pyserial` lives behind the `[serial]` extra so tests and custom transports work
 without it.
+
+### From a released wheel
+
+Download `group3lib-<version>-py3-none-any.whl` from the project's distribution
+channel (GitHub Release, internal index, shared drive, etc.) and install it
+directly:
+
+```bash
+# Core library only (no pyserial):
+pip install group3lib-0.1.0-py3-none-any.whl
+
+# With pyserial for real RS-232 / fiber-optic hardware:
+pip install "group3lib-0.1.0-py3-none-any.whl[serial]"
+```
+
+Point `pip` at a URL or a directory instead if that's how the wheels are
+distributed:
+
+```bash
+pip install https://example.com/downloads/group3lib-0.1.0-py3-none-any.whl
+pip install --find-links ./dist "group3lib[serial]"
+```
+
+### From source
+
+```bash
+git clone <repo-url> group3lib
+cd group3lib
+pip install -e ".[serial]"        # editable install with pyserial
+pip install -e ".[all]"           # editable install with pyserial + dev tools
+```
+
+## Building a wheel for distribution
+
+The project uses the standard PEP 517 build path via [`build`][pypa-build].
+
+```bash
+pip install build               # one-off, into your dev environment
+python -m build                 # runs an isolated build
+```
+
+[pypa-build]: https://pypa-build.readthedocs.io/
+
+This produces two files under `dist/` (which is already gitignored):
+
+```
+dist/
+├── group3lib-0.1.0-py3-none-any.whl     # the wheel — what users install
+└── group3lib-0.1.0.tar.gz               # sdist — fallback when no wheel fits
+```
+
+The wheel tag `py3-none-any` means it installs on any Python 3 interpreter on
+any OS — there is no native code to compile.
+
+**Release checklist:**
+
+1. Bump the `version` field in [`pyproject.toml`](pyproject.toml); wheels with
+   the same version cannot be re-published.
+2. Run `pytest -q && ruff check src tests && mypy --strict src tests` — all
+   must be green before building.
+3. Remove previous artefacts with `rm -rf dist/ build/` so stale versions
+   don't get uploaded by mistake.
+4. Build: `python -m build`.
+5. Smoke-test the wheel in a clean venv:
+   ```bash
+   python -m venv /tmp/g3-verify
+   /tmp/g3-verify/bin/pip install "dist/group3lib-<version>-py3-none-any.whl[serial]"
+   /tmp/g3-verify/bin/python -c "import group3; print(group3.__version__)"
+   rm -rf /tmp/g3-verify
+   ```
+6. Publish the wheel (and optionally the sdist) to your distribution channel:
+   - **GitHub Release:** attach `dist/*` to the tag.
+   - **Private index** (`devpi`, `pypiserver`, AWS CodeArtifact, etc.): push
+     via `twine upload --repository <name> dist/*`.
+   - **Public PyPI:** `pip install twine && twine upload dist/*` (requires an
+     unclaimed package name and a PyPI API token).
 
 ## Quickstart
 
