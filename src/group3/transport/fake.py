@@ -107,6 +107,21 @@ class FakeTransport:
             )
         # The queued-reply deque is *not* touched — write_only has no read half.
 
+    def read_optional(self, timeout: float) -> bytes:
+        """Pop and return the next queued reply, or ``b""`` if the queue is empty.
+
+        In tests, a queued reply represents "what the device happens to send
+        back". For a setter with silent-success, do not queue a reply — the
+        drain returns ``b""`` and the protocol layer treats that as success.
+        """
+        del timeout  # FakeTransport does not model wall-clock timeouts here.
+        if not self._is_open:
+            raise TransportError("FakeTransport is not open. Call open() first.")
+        if not self._replies:
+            return b""
+        item = self._replies.popleft()
+        return _unwrap(item)
+
     # ------------------------------------------------------------------
     # context manager
     # ------------------------------------------------------------------

@@ -49,6 +49,27 @@ class Transport(Protocol):
     def write_only(self, payload: bytes) -> None:
         """Write ``payload`` without reading a reply. Used for broadcast commands."""
 
+    def read_optional(self, timeout: float) -> bytes:
+        """Read a reply if the device sends one within ``timeout`` seconds.
+
+        Returns ``b""`` if no bytes arrive within the window — used by
+        :meth:`Group3Protocol.send_setter` to detect deferred error replies on
+        setters that are silent on success. If some bytes arrive but don't
+        form a complete terminator-ended reply within the window, the partial
+        bytes are still returned so the protocol layer can decide how to react.
+
+        Args:
+            timeout: Seconds to wait for the first byte; once one arrives the
+                implementation should continue reading to a terminator.
+
+        Returns:
+            Reply bytes (with terminator) if received, or ``b""`` if nothing
+            arrived within ``timeout``.
+
+        Raises:
+            TransportError: Underlying I/O failure.
+        """
+
     def __enter__(self) -> Transport:
         """Open on context entry. Returns self for ``with x.open() as t:`` idiom."""
 

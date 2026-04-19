@@ -76,23 +76,29 @@ unattended lab runs.
 | DTM-152 | S | 🛣️ roadmap |
 | DTM-333 | S | 🛣️ roadmap |
 
-To extend to a new model, see
-[`.claude/rules/adding-new-device-model.md`](.claude/rules/adding-new-device-model.md).
+To extend to a new model, see [`docs/extending.md`](docs/extending.md).
 
 ## Testing
 
-All tests run against an in-memory `FakeTransport` — no serial port required:
+Tests cover both the in-memory `FakeTransport` (protocol/model/session) and the
+pyserial path (via a fake `serial.Serial` injected through `monkeypatch`). No
+real serial port is required:
 
 ```bash
 pytest -q
 ruff check src tests
-mypy --strict src
+mypy --strict src tests
 ```
 
 Every public method on `DTM151Serial` has a **golden-transcript test** that pins
 the exact bytes sent on the wire against Table 9 of the manual. If you change a
 command and the test doesn't change too, it almost certainly means your change
-did nothing or broke something.
+did nothing or broke something. The `SerialTransport` tests separately verify
+every DIP-switch-documented reply terminator (CR, LF, CR+LF, LF+CR) plus
+timeout and error-wrapping behaviour.
+
+Real-hardware smoke tests are manual, via `examples/read_field.py`, and are
+not part of the automated suite.
 
 ## Assumptions / manual-dependent TODOs
 

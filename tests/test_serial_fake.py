@@ -13,6 +13,7 @@ from group3 import (
     FakeTransport,
     Group3Protocol,
     NoProbeError,
+    ProtocolError,
     TimeoutError,
     TransportError,
 )
@@ -106,6 +107,66 @@ class TestErrorReplies:
         p = Group3Protocol(fake)
         with pytest.raises(DeviceOverflowError):
             p.send("F")
+
+
+class TestSendSetter:
+    """send_setter covers the 'silent on success, error string on failure' contract."""
+
+    def test_silent_success_does_not_raise(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        p = Group3Protocol(fake)
+        p.send_setter("Z")
+        assert fake.sent == [SENT_Z]
+        # No data was read, no error raised.
+
+    def test_deferred_error_surfaces(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_reply(b" NO PROBE\r")
+        p = Group3Protocol(fake)
+        with pytest.raises(NoProbeError):
+            p.send_setter("Z")
+
+    def test_unexpected_reply_raises_protocol_error(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_reply(b" surprise\r")
+        p = Group3Protocol(fake)
+        with pytest.raises(ProtocolError, match="Unexpected reply"):
+            p.send_setter("Z")
+
+    def test_error_window_zero_skips_drain(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        # Queue an error — but with error_window=0 it won't be read.
+        fake.queue_reply(b" NO PROBE\r")
+        p = Group3Protocol(fake)
+        p.send_setter("Z", error_window=0)
+        assert fake.sent == [SENT_Z]
+        # The error reply is still in the queue; caller could pick it up later.
+        assert list(fake._replies) == [b" NO PROBE\r"]
+
+
+class TestReadOptional:
+    def test_empty_queue_returns_empty_bytes(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        assert fake.read_optional(0.01) == b""
+
+    def test_pops_queued_reply(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_reply(b" data\r")
+        assert fake.read_optional(0.01) == b" data\r"
+        assert fake.read_optional(0.01) == b""
+
+    def test_raises_queued_error(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_error(TransportError("boom"))
+        with pytest.raises(TransportError):
+            fake.read_optional(0.01)
 
 
 class TestTransportErrors:

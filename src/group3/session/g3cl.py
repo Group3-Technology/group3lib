@@ -55,6 +55,18 @@ class AddressedProtocol:
         self._inner.send_no_reply(commands.a_set_address(self._address))
         return self._inner.send(command, timeout=timeout)
 
+    def send_setter(self, command: str, error_window: float | None = None) -> None:
+        """Address the device, then send a silent-success setter.
+
+        Forwards to :meth:`Group3Protocol.send_setter`, which drains the line
+        for deferred error replies (manual §4.5.3).
+        """
+        self._inner.send_no_reply(commands.a_set_address(self._address))
+        if error_window is None:
+            self._inner.send_setter(command)
+        else:
+            self._inner.send_setter(command, error_window=error_window)
+
     def send_no_reply(self, command: str) -> None:
         """Address the device, then send ``command`` without reading a reply."""
         self._inner.send_no_reply(commands.a_set_address(self._address))

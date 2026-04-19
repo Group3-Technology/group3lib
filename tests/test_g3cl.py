@@ -53,6 +53,67 @@ class TestAddressedProtocol:
         dtm.read_field()
         assert fake.sent == [SENT_A5, SENT_F]
 
+    def test_last_raw_tx_includes_address_prefix(self) -> None:
+        """Addressed send must expose A<n> + command in last_raw_tx for debugging."""
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_reply(b" 1.2T\r")
+        protocol = Group3Protocol(fake)
+        session = G3CLSession(protocol)
+        session.select(5).send("F")
+        assert protocol.last_raw_tx == b"A5\rF\r"
+        assert protocol.last_raw_rx == b" 1.2T\r"
+
+    def test_last_raw_tx_accumulates_broadcast_then_addressed(self) -> None:
+        """last_raw_tx reports every byte sent since the last reply was read.
+
+        A broadcast produces no reply, so its bytes carry forward to the next
+        send() — that's honest about what went on the wire, not a bug.
+        """
+        fake = FakeTransport()
+        fake.open()
+        protocol = Group3Protocol(fake)
+        session = G3CLSession(protocol)
+        session.broadcast_trigger()
+        assert protocol.last_raw_tx == b"V\r"
+        fake.queue_reply(b" 0.1T\r")
+        session.select(0).send("F")
+        # The addressed send flushes everything since the last reply: V, A0, F.
+        assert protocol.last_raw_tx == b"V\rA0\rF\r"
+        assert protocol.last_raw_rx == b" 0.1T\r"
+
+    def test_pending_tx_clears_after_transport_failure(self) -> None:
+        """A failed addressed send must not poison the next successful exchange."""
+        fake = FakeTransport()
+        fake.open()
+        protocol = Group3Protocol(fake)
+        session = G3CLSession(protocol)
+        # Arrange: A5 writes succeed (write_only), F read raises a TimeoutError.
+        from group3 import TimeoutError as G3TimeoutError
+        fake.queue_error(G3TimeoutError("simulated"))
+        with pytest.raises(G3TimeoutError):
+            session.select(5).send("F")
+        # The failed attempt's bytes are captured for inspection.
+        assert protocol.last_raw_tx == b"A5\rF\r"
+        # A later successful exchange must NOT include any leaked A5\rF\r.
+        fake.queue_reply(b" 0.5T\r")
+        session.select(10).send("F")
+        assert protocol.last_raw_tx == b"A10\rF\r"
+
+    def test_last_raw_tx_resets_after_each_reply(self) -> None:
+        """Pending bytes clear after every send() that produces a reply."""
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_reply(b" 0.1T\r")
+        fake.queue_reply(b" 0.2T\r")
+        protocol = Group3Protocol(fake)
+        session = G3CLSession(protocol)
+        session.select(5).send("F")
+        assert protocol.last_raw_tx == b"A5\rF\r"
+        session.select(10).send("F")
+        # Previous A5/F is gone — only the latest addressed exchange remains.
+        assert protocol.last_raw_tx == b"A10\rF\r"
+
     def test_address_boundaries(self) -> None:
         fake = FakeTransport()
         fake.open()

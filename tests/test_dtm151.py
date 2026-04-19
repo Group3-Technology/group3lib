@@ -16,6 +16,8 @@ from group3 import (
     FakeTransport,
     FixedRangeProbeError,
     MeasurementMode,
+    NoProbeError,
+    ProtocolError,
     Unit,
 )
 
@@ -81,7 +83,6 @@ class TestReadings:
         assert r.value == pytest.approx(2.9999)
 
     def test_reset_peak_sends_Q(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
-        fake.queue_reply(b" \r")
         dtm.reset_peak()
         assert fake.sent == [SENT_Q]
 
@@ -98,12 +99,10 @@ class TestRange:
         assert fake.sent == [SENT_IR]
 
     def test_set_range_sends_Rn(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
-        fake.queue_reply(b" \r")
         dtm.set_range(0)
         assert fake.sent == [SENT_R0]
 
     def test_set_range_boundary_3(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
-        fake.queue_reply(b" \r")
         dtm.set_range(3)
         assert fake.sent == [SENT_R3]
 
@@ -118,14 +117,60 @@ class TestRange:
     def test_set_range_rejects_bool(self, dtm: DTM151Serial) -> None:
         # bool is a subclass of int — explicitly reject to avoid True→1, False→0 surprises
         with pytest.raises(CommandError):
-            dtm.set_range(True)  # type: ignore[arg-type]
+            dtm.set_range(True)
 
     def test_set_range_on_fixed_probe_raises(
         self, dtm: DTM151Serial, fake: FakeTransport
     ) -> None:
+        """Deferred error from silent-success setter: the drain catches it."""
         fake.queue_reply(b" FIXED RANGE PROBE\r")
         with pytest.raises(FixedRangeProbeError):
             dtm.set_range(2)
+
+
+# --------------------------------------------------------------------------- #
+# Deferred error detection on silent-success setters (manual §4.5.3)
+# --------------------------------------------------------------------------- #
+
+
+class TestSetterDeferredErrors:
+    """Setters are silent on success but return §4.5.3 error strings on failure.
+
+    Group3Protocol.send_setter() drains the line for a short window after each
+    setter write and raises the matching DeviceError if an error string arrives.
+    """
+
+    def test_silent_success_does_not_raise(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        # No reply queued — drain returns b"" and the setter succeeds.
+        dtm.zero()
+        assert fake.sent == [SENT_Z]
+
+    def test_no_probe_surfaces_from_zero(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.queue_reply(b" NO PROBE\r")
+        with pytest.raises(NoProbeError):
+            dtm.zero()
+
+    def test_unexpected_reply_raises_protocol_error(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        """A non-error reply to a silent-success setter means desync — raise."""
+        fake.queue_reply(b" surprise\r")
+        with pytest.raises(ProtocolError, match="Unexpected reply"):
+            dtm.zero()
+
+    def test_multiple_setters_in_sequence(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        """Back-to-back setters all succeed when the device stays silent."""
+        dtm.set_dc_mode()
+        dtm.set_continuous_mode()
+        dtm.set_range(1)
+        dtm.zero()
+        assert fake.sent == [SENT_GD, SENT_GC, b"R1\r", SENT_Z]
 
 
 # --------------------------------------------------------------------------- #
@@ -135,22 +180,18 @@ class TestRange:
 
 class TestZeroAndErase:
     def test_zero_sends_Z(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
-        fake.queue_reply(b" \r")
         dtm.zero()
         assert fake.sent == [SENT_Z]
 
     def test_erase_zero_sends_EZ(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
-        fake.queue_reply(b" \r")
         dtm.erase_zero()
         assert fake.sent == [SENT_EZ]
 
     def test_erase_peak_sends_EP(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
-        fake.queue_reply(b" \r")
         dtm.erase_peak()
         assert fake.sent == [SENT_EP]
 
     def test_erase_offset_sends_EO(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
-        fake.queue_reply(b" \r")
         dtm.erase_offset()
         assert fake.sent == [SENT_EO]
 
@@ -167,12 +208,10 @@ class TestZeroAndErase:
 
 class TestFilter:
     def test_filter_on(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
-        fake.queue_reply(b" \r")
         dtm.set_filter_enabled(True)
         assert fake.sent == [SENT_D1]
 
     def test_filter_off(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
-        fake.queue_reply(b" \r")
         dtm.set_filter_enabled(False)
         assert fake.sent == [SENT_D0]
 
@@ -182,7 +221,6 @@ class TestFilter:
         assert fake.sent == [SENT_ID]
 
     def test_set_filter_factor(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
-        fake.queue_reply(b" \r")
         dtm.set_filter_factor(41)
         assert fake.sent == [SENT_J41]
 
@@ -200,7 +238,6 @@ class TestFilter:
         assert fake.sent == [SENT_IJ]
 
     def test_set_filter_window(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
-        fake.queue_reply(b" \r")
         dtm.set_filter_window(0.5)
         assert fake.sent == [SENT_Y05]
 
@@ -222,22 +259,18 @@ class TestFilter:
 
 class TestMode:
     def test_ac(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
-        fake.queue_reply(b" \r")
         dtm.set_ac_mode()
         assert fake.sent == [SENT_GA]
 
     def test_dc(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
-        fake.queue_reply(b" \r")
         dtm.set_dc_mode()
         assert fake.sent == [SENT_GD]
 
     def test_continuous(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
-        fake.queue_reply(b" \r")
         dtm.set_continuous_mode()
         assert fake.sent == [SENT_GC]
 
     def test_triggered(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
-        fake.queue_reply(b" \r")
         dtm.set_triggered_mode()
         assert fake.sent == [SENT_GV]
 
@@ -285,7 +318,6 @@ class TestAddressingAndCalibration:
             dtm.set_address(31)
 
     def test_set_calibration(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
-        fake.queue_reply(b" \r")
         dtm.set_calibration(2)
         assert fake.sent == [SENT_SC_2]
 
@@ -299,12 +331,10 @@ class TestAddressingAndCalibration:
         assert fake.sent == [SENT_IC]
 
     def test_erase_calibration(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
-        fake.queue_reply(b" \r")
         dtm.erase_calibration()
         assert fake.sent == [SENT_EC]
 
     def test_set_offset_negative(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
-        fake.queue_reply(b" \r")
         dtm.set_offset(-1)
         assert fake.sent == [SENT_O_MINUS_1]
 
@@ -314,7 +344,6 @@ class TestAddressingAndCalibration:
         assert fake.sent == [SENT_IO]
 
     def test_erase_scale(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
-        fake.queue_reply(b" \r")
         dtm.erase_scale()
         assert fake.sent == [SENT_EL]
 

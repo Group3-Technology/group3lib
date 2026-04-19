@@ -33,6 +33,7 @@ class _ProtocolLike(Protocol):
 
     def send(self, command: str, timeout: float | None = None) -> str: ...
     def send_no_reply(self, command: str) -> None: ...
+    def send_setter(self, command: str) -> None: ...
 
 
 # Default wait time between ``V`` (trigger) and ``F`` (read) per manual section 4.7.3.
@@ -67,7 +68,7 @@ class DTM151Serial:
 
     def reset_peak(self) -> None:
         """Reset the peak-hold value to zero (``Q`` command)."""
-        self._protocol.send(commands.Q)
+        self._protocol.send_setter(commands.Q)
 
     # ------------------------------------------------------------------
     # range selection
@@ -89,10 +90,11 @@ class DTM151Serial:
 
         Raises:
             CommandError: ``index`` is outside 0..3.
-            FixedRangeProbeError: The attached probe is single-range.
+            FixedRangeProbeError: The attached probe is single-range (raised from
+                a deferred error reply within the setter drain window).
         """
         cmd = commands.r_set_range(index)
-        self._protocol.send(cmd)
+        self._protocol.send_setter(cmd)
 
     # ------------------------------------------------------------------
     # zero / erase
@@ -100,19 +102,19 @@ class DTM151Serial:
 
     def zero(self) -> None:
         """Zero the currently selected range (``Z`` command)."""
-        self._protocol.send(commands.Z)
+        self._protocol.send_setter(commands.Z)
 
     def erase_zero(self) -> None:
         """Cancel the zero correction on the current range (``EZ`` command)."""
-        self._protocol.send(commands.EZ)
+        self._protocol.send_setter(commands.EZ)
 
     def erase_peak(self) -> None:
         """Reset the peak-hold value (``EP`` command)."""
-        self._protocol.send(commands.EP)
+        self._protocol.send_setter(commands.EP)
 
     def erase_offset(self) -> None:
         """Clear the offset on all ranges (``EO`` command)."""
-        self._protocol.send(commands.EO)
+        self._protocol.send_setter(commands.EO)
 
     def get_zero_offset(self) -> float:
         """Inspect the stored zero-offset for the current range (``IZ`` command).
@@ -137,7 +139,7 @@ class DTM151Serial:
 
     def set_filter_enabled(self, enabled: bool) -> None:
         """Enable or disable digital filtering (``D1`` / ``D0``)."""
-        self._protocol.send(commands.D1 if enabled else commands.D0)
+        self._protocol.send_setter(commands.D1 if enabled else commands.D0)
 
     def get_filter_factor(self) -> int:
         """Return the current filter factor ``J`` (``IJ`` command; manual §4.6)."""
@@ -146,7 +148,7 @@ class DTM151Serial:
 
     def set_filter_factor(self, factor: int) -> None:
         """Set the filter factor ``J`` (``Jn`` command; range 1..65534, default 41)."""
-        self._protocol.send(commands.j_set_filter_factor(factor))
+        self._protocol.send_setter(commands.j_set_filter_factor(factor))
 
     def get_filter_window(self) -> float:
         """Return the current filter window half-width (``IY`` command).
@@ -160,7 +162,7 @@ class DTM151Serial:
 
     def set_filter_window(self, value: float) -> None:
         """Set the filter window half-width (``Yn``; manual §4.6)."""
-        self._protocol.send(commands.y_set_filter_window(value))
+        self._protocol.send_setter(commands.y_set_filter_window(value))
 
     # ------------------------------------------------------------------
     # mode (DC/AC, continuous/triggered)
@@ -168,22 +170,22 @@ class DTM151Serial:
 
     def set_ac_mode(self) -> None:
         """Switch to AC measurement mode (``GA``)."""
-        self._protocol.send(commands.GA)
+        self._protocol.send_setter(commands.GA)
 
     def set_dc_mode(self) -> None:
         """Switch to DC measurement mode (``GD``)."""
-        self._protocol.send(commands.GD)
+        self._protocol.send_setter(commands.GD)
 
     def set_continuous_mode(self) -> None:
         """Set continuous acquisition (``GC``)."""
-        self._protocol.send(commands.GC)
+        self._protocol.send_setter(commands.GC)
 
     def set_triggered_mode(self) -> None:
         """Set triggered acquisition (``GV``; manual §4.7).
 
         After this, the device will only measure on receipt of a broadcast ``V``.
         """
-        self._protocol.send(commands.GV)
+        self._protocol.send_setter(commands.GV)
 
     def get_status(self) -> DeviceStatus:
         """Return DC/AC and continuous/triggered status (``IG`` command)."""
@@ -242,11 +244,11 @@ class DTM151Serial:
 
     def set_calibration(self, factor: float) -> None:
         """Set the calibration factor directly (``SCn`` command)."""
-        self._protocol.send(commands.sc_set_calibration(factor))
+        self._protocol.send_setter(commands.sc_set_calibration(factor))
 
     def erase_calibration(self) -> None:
         """Reset the calibration factor to 1 on the current range (``EC``)."""
-        self._protocol.send(commands.EC)
+        self._protocol.send_setter(commands.EC)
 
     def get_offset(self) -> float:
         """Inspect the offset (``IO`` command)."""
@@ -255,7 +257,7 @@ class DTM151Serial:
 
     def set_offset(self, value: float) -> None:
         """Set the offset added to every field reading (``On`` command)."""
-        self._protocol.send(commands.o_set_offset(value))
+        self._protocol.send_setter(commands.o_set_offset(value))
 
     def get_scale(self) -> float:
         """Inspect the scale factor (``IL`` command)."""
@@ -264,4 +266,4 @@ class DTM151Serial:
 
     def erase_scale(self) -> None:
         """Reset the scale factor to 1 on all ranges (``EL`` command)."""
-        self._protocol.send(commands.EL)
+        self._protocol.send_setter(commands.EL)
