@@ -72,6 +72,17 @@ class AddressedProtocol:
         self._inner.send_no_reply(commands.a_set_address(self._address))
         self._inner.send_no_reply(command)
 
+    # Deliberately no ``read_next`` / ``drain_pending`` here.
+    #
+    # Streaming (``SM1``) is not supported on the G3CL addressed loop: the
+    # device sends replies without an address tag, so a consumer listening on
+    # one :class:`AddressedProtocol` would indiscriminately absorb readings
+    # from any other device on the loop that also has ``SM1`` enabled. The
+    # resulting ambiguity is worse than the feature is worth — use point-to-
+    # point (a single :class:`Group3Protocol` wired to one device) for
+    # streaming workflows. :meth:`DTM151Serial.stream_field` enforces this
+    # with a runtime ``isinstance`` check.
+
     @property
     def last_raw_tx(self) -> bytes:
         return self._inner.last_raw_tx

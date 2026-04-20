@@ -218,6 +218,49 @@ class SerialTransport:
         except Exception as exc:
             raise TransportError(f"Failed to write to serial port: {exc}") from exc
 
+    def read_reply(self, timeout: float) -> bytes:
+        """Block up to ``timeout`` s for a full reply; raise if none arrives.
+
+        Semantics match the read-half of :meth:`request`: reads bytes until
+        the device sends its terminator. If the timeout elapses before the
+        first byte (no data at all), we raise :class:`TimeoutError`
+        immediately. If bytes have started arriving but no terminator is
+        seen within the window, we also raise — returning a partial reply
+        to a streaming consumer would desync the stream.
+        """
+        if timeout < 0:
+            raise ValueError("timeout must be >= 0")
+        ser = self._require_open()
+        original_timeout = ser.timeout
+        try:
+            ser.timeout = timeout
+            buf = bytearray()
+            deadline = time.monotonic() + timeout
+            term_bytes = self._terminator_bytes
+            while time.monotonic() < deadline:
+                try:
+                    chunk = ser.read(1)
+                except Exception as exc:
+                    raise TransportError(
+                        f"Failed to read from serial port: {exc}"
+                    ) from exc
+                if not chunk:
+                    continue
+                buf.extend(chunk)
+                if chunk[0] in term_bytes:
+                    self._consume_paired_terminator(ser, buf, chunk[0])
+                    return bytes(buf)
+            if buf:
+                raise Group3TimeoutError(
+                    f"Timed out after {timeout}s waiting for terminator "
+                    f"(got partial reply: {bytes(buf)!r})"
+                )
+            raise Group3TimeoutError(
+                f"Timed out after {timeout}s with no reply"
+            )
+        finally:
+            ser.timeout = original_timeout
+
     def read_optional(self, timeout: float) -> bytes:
         """Read a reply if one arrives within ``timeout`` seconds.
 

@@ -2,9 +2,10 @@
 
 A typed Python driver library for Group3 Technology digital teslameters.
 
-**v0.1 supports the DTM-151-S (serial variant).** The architecture is deliberately
-layered (transport / protocol / session / model) so that future models — DTM-152,
-DTM-333, HTM-121, etc. — slot in without rewriting the core.
+**v0.2 supports the DTM-151-S (serial variant), including live `SM1`
+streaming and probe-temperature reads.** The architecture is deliberately
+layered (transport / protocol / session / model) so that future models —
+DTM-152, DTM-333, HTM-121, etc. — slot in without rewriting the core.
 
 ## Install
 
@@ -20,17 +21,20 @@ directly:
 
 ```bash
 # Core library only (no pyserial):
-pip install group3lib-0.1.0-py3-none-any.whl
+pip install group3lib-0.2.0-py3-none-any.whl
 
 # With pyserial for real RS-232 / fiber-optic hardware:
-pip install "group3lib-0.1.0-py3-none-any.whl[serial]"
+pip install "group3lib-0.2.0-py3-none-any.whl[serial]"
+
+# Add live-plot support (matplotlib):
+pip install "group3lib-0.2.0-py3-none-any.whl[serial,plot]"
 ```
 
 Point `pip` at a URL or a directory instead if that's how the wheels are
 distributed:
 
 ```bash
-pip install https://example.com/downloads/group3lib-0.1.0-py3-none-any.whl
+pip install https://example.com/downloads/group3lib-0.2.0-py3-none-any.whl
 pip install --find-links ./dist "group3lib[serial]"
 ```
 
@@ -58,8 +62,8 @@ This produces two files under `dist/` (which is already gitignored):
 
 ```
 dist/
-├── group3lib-0.1.0-py3-none-any.whl     # the wheel — what users install
-└── group3lib-0.1.0.tar.gz               # sdist — fallback when no wheel fits
+├── group3lib-0.2.0-py3-none-any.whl     # the wheel — what users install
+└── group3lib-0.2.0.tar.gz               # sdist — fallback when no wheel fits
 ```
 
 The wheel tag `py3-none-any` means it installs on any Python 3 interpreter on
@@ -110,6 +114,62 @@ dtm.set_triggered_mode()
 reading = dtm.trigger()   # sends V, waits 175 ms, sends F
 ```
 
+Read probe temperature (requires a temperature-corrected probe, LPT/MPT-141
+or -231):
+
+```python
+temp = dtm.read_temperature()
+print(f"{temp.value:+.2f} °C")
+```
+
+## Live streaming (SM1 / Kn)
+
+> **Point-to-point only.** Streaming is not supported on the G3CL addressed
+> loop — ``SM1`` replies carry no address tag, so a consumer listening on
+> one addressed device would indiscriminately absorb readings from any
+> other streaming device on the loop. `dtm.stream_field()` on an
+> `AddressedProtocol` raises `NotImplementedError`.
+
+Enable the device's built-in auto-transmit mode (`SM1`) for continuous
+acquisition. `stream_field` is a context manager — it sets up `SM1` (and
+optionally `Kn` via `interval_seconds`) on entry and restores the prior
+state on exit, including draining any reading that was in flight when the
+stream stops:
+
+```python
+with dtm.stream_field(interval_seconds=0) as stream:   # 0 = device max rate (10 Hz)
+    for reading in stream:
+        handle(reading)
+        if done:
+            break
+```
+
+`interval_seconds` maps directly to the device's `Kn` command — it's an
+integer number of seconds between readings: `0` = max rate (10 Hz
+internal), `1` = 1 Hz, `60` = once per minute, up to `65534`. The DTM-151
+cannot produce non-integer-second intervals, so the API deliberately
+mirrors that restriction rather than silently quantising a `rate_hz` value.
+
+Interleave other commands (like `read_temperature`) without desyncing the
+bus by pausing the stream:
+
+```python
+with dtm.stream_field(interval_seconds=0) as stream:
+    last_temp = 0.0
+    for reading in stream:
+        plot_field(reading)
+        now = time.monotonic()
+        if now - last_temp >= 1.0:
+            with stream.paused():       # sends SM0, drains tail
+                temp = dtm.read_temperature()
+            plot_temp(temp)
+            last_temp = now             # SM1 re-issued on block exit
+```
+
+See [`examples/live_plot.py`](examples/live_plot.py) for a full matplotlib
+example that streams field at 10 Hz and temperature at 1 Hz simultaneously
+(requires the `[plot]` extra for `matplotlib`).
+
 ## G3CL multi-drop
 
 Up to 31 Group3 devices share a single G3CL loop, addressed 0..30:
@@ -139,12 +199,46 @@ unattended lab runs.
 
 | Model | Variant | Status |
 | --- | --- | --- |
-| DTM-151 | S (serial) | ✅ v0.1 |
+| DTM-151 | S (serial) | ✅ v0.2 — field, peak, temperature, streaming, G3CL |
 | DTM-151 | G (IEEE-488) | ❌ out of scope |
 | DTM-152 | S | 🛣️ roadmap |
 | DTM-333 | S | 🛣️ roadmap |
 
 To extend to a new model, see [`docs/extending.md`](docs/extending.md).
+
+## Supported commands
+
+Cross-reference:
+`manuals/DTM-151-S Manual_v7.1.pdf` (Table 9) and
+`manuals/DTM-151 v7.1 Commands -Confidential.pdf`.
+
+| Command | Python API | Notes |
+| --- | --- | --- |
+| `F` | `dtm.read_field()` | Field reading |
+| `P` | `dtm.read_peak()` | Peak-hold field |
+| `Q` | `dtm.reset_peak()` | Reset peak-hold |
+| `T` | `dtm.read_temperature()` | Probe temperature (temp-corrected probes) |
+| `Z` / `EZ` | `dtm.zero()` / `dtm.erase_zero()` | Current-range zero |
+| `Rn` / `IR` | `dtm.set_range(n)` / `dtm.get_range()` | 0.3 / 0.6 / 1.2 / 3.0 T |
+| `GA` / `GD` | `dtm.set_ac_mode()` / `dtm.set_dc_mode()` | Measurement mode |
+| `GC` / `GV` | `dtm.set_continuous_mode()` / `dtm.set_triggered_mode()` | Acquisition mode |
+| `V` | `dtm.trigger()`, `session.broadcast_trigger()` | Triggered reading |
+| `D0` / `D1` / `ID` | `dtm.set_filter_enabled()` / `dtm.get_filter_enabled()` | Digital filter |
+| `Jn` / `IJ` | `dtm.set_filter_factor()` / `dtm.get_filter_factor()` | Filter factor |
+| `Yn` / `IY` | `dtm.set_filter_window()` / `dtm.get_filter_window()` | Filter window |
+| `On` / `IO` / `EO` | `dtm.set_offset()` / `dtm.get_offset()` / `dtm.erase_offset()` | Offset |
+| `SCn` / `IC` / `EC` | `dtm.set_calibration()` / `dtm.get_calibration()` / `dtm.erase_calibration()` | Calibration |
+| `IL` / `EL` | `dtm.get_scale()` / `dtm.erase_scale()` | Scale factor |
+| `IG` | `dtm.get_status()` | DC/AC + continuous/triggered |
+| `An` | `session.select(addr)`, `dtm.set_address()` | G3CL addressing |
+| `SMn` | `dtm.set_auto_transmit()`, `dtm.stream_field()` | Auto-transmit (streaming) |
+| `Kn` / `IK` | `dtm.set_sampling_interval()` / `dtm.get_sampling_interval()` | Streaming rate |
+
+Commands from the confidentials reference that are **not yet exposed**:
+`ISF` (firmware version), `ISS` (serial number), `SUn` (send units),
+`SEn` (echo on/off), `WA`/`WE`/`WZ` (raw field inspects), and the entire
+calibration submenu (factory-only). These are pending confirmation of which
+commands are customer-facing.
 
 ## Testing
 
@@ -165,8 +259,12 @@ did nothing or broke something. The `SerialTransport` tests separately verify
 every DIP-switch-documented reply terminator (CR, LF, CR+LF, LF+CR) plus
 timeout and error-wrapping behaviour.
 
-Real-hardware smoke tests are manual, via `examples/read_field.py`, and are
-not part of the automated suite.
+Real-hardware smoke tests are manual — see
+[`examples/read_field.py`](examples/read_field.py),
+[`examples/read_temperature.py`](examples/read_temperature.py),
+[`examples/dtm151_walkthrough.py`](examples/dtm151_walkthrough.py), and
+[`examples/live_plot.py`](examples/live_plot.py) — and are not part of the
+automated suite.
 
 ## Assumptions / manual-dependent TODOs
 

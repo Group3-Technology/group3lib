@@ -111,6 +111,56 @@ class Group3Protocol:
         check_error(reply)
         return reply
 
+    def drain_pending(self, window: float = 0.05) -> list[bytes]:
+        """Drain any in-flight replies from the transport.
+
+        Reads from the transport with a short per-read window until nothing
+        arrives. Used around streaming transitions (start/stop/pause/resume)
+        to absorb replies that may have been mid-transmission when a mode
+        change was issued.
+
+        Returns the raw bytes drained so callers (typically tests) can
+        inspect them. In normal operation the return value is discarded.
+        """
+        drained: list[bytes] = []
+        while True:
+            chunk = self.transport.read_optional(window)
+            if not chunk:
+                break
+            drained.append(chunk)
+        return drained
+
+    def read_next(self, timeout: float) -> str:
+        """Read one unsolicited reply from the device (for streaming).
+
+        Used by :class:`DTM151Serial.stream_field` to consume replies the
+        device sends autonomously in ``SM1`` mode. This is a pure read — no
+        command is written. The terminator is stripped, the reply is checked
+        against the §4.5.3 error table, and the cleaned string is returned.
+
+        Args:
+            timeout: Seconds to wait for the next reply. If nothing arrives,
+                :class:`TimeoutError` is raised.
+
+        Returns:
+            The normalised reply string (terminators stripped, leading space
+            from manual §4.5.2 preserved).
+
+        Raises:
+            TransportError: Underlying I/O failed.
+            TimeoutError: No reply within ``timeout``.
+            ProtocolError: Reply was not valid ASCII.
+            DeviceError: The device sent a named error string.
+        """
+        raw = self.transport.read_reply(timeout)
+        # Streaming reads don't carry a "request" payload — _pending_tx and
+        # _last.tx are preserved as-is so the last paired TX still reflects
+        # the most recent command the caller issued.
+        self._last = _LastExchange(tx=self._last.tx, rx=raw)
+        reply = codec.strip_terminators(codec.decode(raw))
+        check_error(reply)
+        return reply
+
     def send_no_reply(self, command: str) -> None:
         """Send ``command`` via :meth:`Transport.write_only` with no read.
 

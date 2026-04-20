@@ -148,6 +148,27 @@ class TestSendSetter:
         assert list(fake._replies) == [b" NO PROBE\r"]
 
 
+class TestReadReply:
+    """FakeTransport.read_reply: pops queued reply or raises TimeoutError."""
+
+    def test_pops_queued_reply(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_reply(b" 1.2T\r")
+        assert fake.read_reply(timeout=0.1) == b" 1.2T\r"
+
+    def test_empty_queue_raises_timeout(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        with pytest.raises(TimeoutError, match="no reply queued"):
+            fake.read_reply(timeout=0.1)
+
+    def test_closed_transport_raises_transport_error(self) -> None:
+        fake = FakeTransport()
+        with pytest.raises(TransportError):
+            fake.read_reply(timeout=0.1)
+
+
 class TestReadOptional:
     def test_empty_queue_returns_empty_bytes(self) -> None:
         fake = FakeTransport()

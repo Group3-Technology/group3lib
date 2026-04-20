@@ -7,16 +7,19 @@ from enum import Enum
 
 
 class Unit(str, Enum):
-    """Field-measurement units reported by the teslameter.
+    """Units reported by the teslameter.
 
-    The DTM-151 reports in either tesla or gauss depending on an internal switch
-    (DTM-151-S Manual v7.1, Table 4). Replies may append ``T`` or ``G`` as a
-    single-character suffix when the format switch is configured to include units.
+    The DTM-151 reports field values in tesla or gauss (selected by DIP switch
+    S2-5; DTM-151-S Manual v7.1, Table 4). Replies may append a single-
+    character unit suffix when the format switch is configured to include units
+    (S2-6, or the ``SUn`` command). Temperature replies from the ``T`` command
+    use ``C`` (degrees Celsius).
     """
 
     TESLA = "T"
     GAUSS = "G"
     KILOGAUSS = "kG"
+    CELSIUS = "C"
     UNKNOWN = "?"
 
 

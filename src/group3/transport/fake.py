@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections import deque
 from types import TracebackType
 
+from group3.exceptions import TimeoutError as Group3TimeoutError
 from group3.exceptions import TransportError
 
 _QueueItem = bytes | BaseException
@@ -119,6 +120,24 @@ class FakeTransport:
             raise TransportError("FakeTransport is not open. Call open() first.")
         if not self._replies:
             return b""
+        item = self._replies.popleft()
+        return _unwrap(item)
+
+    def read_reply(self, timeout: float) -> bytes:
+        """Pop the next queued reply, or raise :class:`TimeoutError` if empty.
+
+        The streaming contract: "no data" is exceptional, not success. Tests
+        that want to simulate streaming pre-queue one reply per expected
+        iteration; tests that want to simulate a stall leave the queue
+        empty.
+        """
+        del timeout  # FakeTransport does not model wall-clock timeouts here.
+        if not self._is_open:
+            raise TransportError("FakeTransport is not open. Call open() first.")
+        if not self._replies:
+            raise Group3TimeoutError(
+                "FakeTransport.read_reply: no reply queued (streaming stall)"
+            )
         item = self._replies.popleft()
         return _unwrap(item)
 

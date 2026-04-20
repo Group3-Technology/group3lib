@@ -52,7 +52,7 @@ from group3.exceptions import (
     TimeoutError,
     TransportError,
 )
-from group3.models.dtm151 import DTM151Serial
+from group3.models.dtm151 import DTM151Serial, FieldStream
 from group3.protocol.core import Group3Protocol
 from group3.session.g3cl import AddressedProtocol, G3CLSession
 from group3.transport.base import Transport
@@ -67,7 +67,7 @@ from group3.types import (
     Unit,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "AcquisitionMode",
@@ -81,6 +81,7 @@ __all__ = [
     "DeviceStatus",
     "DivideByZeroError",
     "FakeTransport",
+    "FieldStream",
     "FixedRangeProbeError",
     "FramingError",
     "G3CLSession",

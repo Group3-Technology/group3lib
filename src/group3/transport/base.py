@@ -70,6 +70,26 @@ class Transport(Protocol):
             TransportError: Underlying I/O failure.
         """
 
+    def read_reply(self, timeout: float) -> bytes:
+        """Read one full reply, blocking up to ``timeout`` seconds.
+
+        Unlike :meth:`read_optional`, this *raises* ``TimeoutError`` if no
+        complete reply arrives in time. Used by streaming consumers (e.g.
+        ``DTM151Serial.stream_field``) where "no data" is exceptional rather
+        than expected.
+
+        Args:
+            timeout: Maximum seconds to wait for a full terminator-ended
+                reply.
+
+        Returns:
+            Reply bytes including the device's terminator.
+
+        Raises:
+            TimeoutError: No complete reply within ``timeout``.
+            TransportError: Underlying I/O failure.
+        """
+
     def __enter__(self) -> Transport:
         """Open on context entry. Returns self for ``with x.open() as t:`` idiom."""
 

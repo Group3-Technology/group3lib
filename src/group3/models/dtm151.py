@@ -13,10 +13,13 @@ The class accepts any object that exposes ``send(str, timeout)`` and
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from typing import Protocol, runtime_checkable
 
 from group3.exceptions import CommandError
 from group3.protocol import commands
+from group3.protocol.core import Group3Protocol
 from group3.protocol.parser import (
     parse_bool_flag,
     parse_float,
@@ -29,7 +32,15 @@ from group3.types import DeviceStatus, Reading
 
 @runtime_checkable
 class _ProtocolLike(Protocol):
-    """Structural type shared by ``Group3Protocol`` and ``AddressedProtocol``."""
+    """Structural type shared by ``Group3Protocol`` and ``AddressedProtocol``.
+
+    Only request/reply and write-only operations are declared here. The
+    streaming primitives (``read_next``, ``drain_pending``) live on
+    :class:`Group3Protocol` only — streaming on a G3CL addressed loop is
+    unsafe because SM1 readings carry no address tag and cannot be
+    attributed to a specific device. :meth:`DTM151Serial.stream_field`
+    enforces this with a runtime check.
+    """
 
     def send(self, command: str, timeout: float | None = None) -> str: ...
     def send_no_reply(self, command: str) -> None: ...
@@ -38,6 +49,17 @@ class _ProtocolLike(Protocol):
 
 # Default wait time between ``V`` (trigger) and ``F`` (read) per manual section 4.7.3.
 _TRIGGER_SETTLE_SECONDS: float = 0.175
+
+# Default per-reply wait inside a field stream. At Kn=1 (1 Hz) we expect a
+# reading every ~1 s; 2 s gives comfortable headroom. Callers can override for
+# slower Kn values.
+_DEFAULT_STREAM_TIMEOUT: float = 2.0
+
+# Short window used to drain in-flight replies around streaming transitions
+# (SM1→SM0, pause/resume). Needs to be long enough to catch a reading that
+# was already mid-transmission, short enough that it doesn't slow the user
+# down. 50 ms comfortably absorbs a ~20-byte reply at 9600 baud.
+_STREAM_DRAIN_WINDOW: float = 0.05
 
 
 class DTM151Serial:
@@ -64,6 +86,24 @@ class DTM151Serial:
     def read_peak(self) -> Reading:
         """Request and return the peak-hold field reading (``P`` command)."""
         reply = self._protocol.send(commands.P)
+        return parse_reading(reply)
+
+    def read_temperature(self) -> Reading:
+        """Request and return the probe temperature (``T`` command).
+
+        The probe's temperature sensor is calibrated for temperature-corrected
+        Hall-probe variants (LPT/MPT-141/231). On a non-temperature-corrected
+        probe the device replies with ``NO TEMPERATURE PROBE``; this method
+        raises :class:`NoTemperatureProbeError` in that case. A faulty sensor
+        raises :class:`BadTemperatureReadingError`.
+
+        The reply format matches :meth:`read_field` — a floating-point value
+        with an optional ``C`` unit suffix when ``SUn``/S2-6 is enabled.
+
+        Source: ``manuals/DTM-151 v7.1 Commands -Confidential.pdf`` (row
+        "Temperature Reading: Request").
+        """
+        reply = self._protocol.send(commands.T)
         return parse_reading(reply)
 
     def reset_peak(self) -> None:
@@ -231,6 +271,113 @@ class DTM151Serial:
         """
         self._protocol.send_no_reply(commands.a_set_address(address))
 
+    # ------------------------------------------------------------------
+    # Streaming mode (SM1 / Kn) and sampling rate
+    # ------------------------------------------------------------------
+
+    def set_auto_transmit(self, enabled: bool) -> None:
+        """Enable or disable auto-transmit mode (``SM1`` / ``SM0``).
+
+        When ``enabled`` is True, the device sends a reading every ``Kn``
+        seconds without being asked. Use :meth:`set_sampling_interval` to
+        control the rate, or :meth:`stream_field` as the higher-level
+        context-managed API.
+
+        Per the DTM-151 Commands v7.1 reference, ``SMn`` is documented as
+        producing no reply (``GET_DATA=n``, ``GET_TERM=n``) — so unlike
+        other setters we do not drain for a deferred error. After ``SM1``
+        the next bytes on the bus are real streaming readings, not an
+        error code.
+        """
+        self._protocol.send_no_reply(commands.sm_set_send_mode(enabled))
+
+    def set_sampling_interval(self, seconds: int) -> None:
+        """Set the auto-transmit interval ``Kn`` in seconds.
+
+        ``0`` selects the maximum rate (every internal measurement, 10 Hz).
+        ``1`` selects 1 Hz, ``60`` selects once per minute, and so on up to
+        ``65534`` (≈18 hours).
+        """
+        self._protocol.send_setter(commands.k_set_sampling_rate(seconds))
+
+    def get_sampling_interval(self) -> int:
+        """Return the current sampling interval ``Kn`` (``IK`` command)."""
+        reply = self._protocol.send(commands.IK)
+        return parse_int(reply)
+
+    @contextmanager
+    def stream_field(
+        self,
+        interval_seconds: int | None = None,
+        timeout: float = _DEFAULT_STREAM_TIMEOUT,
+    ) -> Iterator[FieldStream]:
+        """Context-managed iterator over streamed field readings (``SM1``).
+
+        On entry, optionally sets ``Kn`` from ``interval_seconds``, then sends
+        ``SM1`` to start auto-transmission. On exit, sends ``SM0``, drains any
+        in-flight reply, and restores the original ``Kn`` if it was changed.
+
+        Args:
+            interval_seconds: Seconds between readings — the ``Kn`` parameter
+                (DTM-151 Commands v7.1). Pass ``0`` for the device's internal
+                maximum rate (every measurement, 10 Hz); pass ``1`` for 1 Hz,
+                ``60`` for once per minute, and so on up to ``65534``. If
+                omitted, the device's existing ``Kn`` is used unchanged. The
+                device cannot express non-integer-second intervals other than
+                the implicit 10 Hz (``K0``) — this API parameter mirrors the
+                device's native units so intent is never silently quantized.
+            timeout: Per-reading wait inside the iterator. Raises
+                :class:`TimeoutError` from ``__next__`` if a reading doesn't
+                arrive in time.
+
+        Yields:
+            A :class:`FieldStream` iterator. Use ``for reading in stream:``
+            to consume, and ``with stream.paused():`` to issue other commands
+            (e.g., :meth:`read_temperature`) without desyncing the bus.
+
+        Raises:
+            NotImplementedError: The protocol is a G3CL
+                :class:`~group3.session.g3cl.AddressedProtocol`. Streaming
+                on a multi-drop loop is unsafe because ``SM1`` readings do
+                not carry an address tag; a streaming consumer on one
+                address would indiscriminately absorb readings from any
+                other device on the loop that also has ``SM1`` enabled. Use
+                point-to-point (single ``Group3Protocol`` + one device) for
+                streaming.
+        """
+        if not isinstance(self._protocol, Group3Protocol):
+            raise NotImplementedError(
+                "stream_field requires a point-to-point Group3Protocol. "
+                "Streaming is not supported on G3CL AddressedProtocol because "
+                "SM1 readings carry no address tag and could be confused with "
+                "other devices' output on the shared loop."
+            )
+        protocol: Group3Protocol = self._protocol
+
+        previous_kn: int | None = None
+        if interval_seconds is not None:
+            # Validate up-front via the command builder — raises CommandError
+            # on a bad value without issuing the IK round-trip first.
+            commands.k_set_sampling_rate(interval_seconds)
+            previous_kn = self.get_sampling_interval()
+            self.set_sampling_interval(interval_seconds)
+
+        self.set_auto_transmit(True)
+        stream = FieldStream(protocol, timeout=timeout)
+        try:
+            yield stream
+        finally:
+            try:
+                self.set_auto_transmit(False)
+            finally:
+                # Always absorb any reading that was in flight when we sent
+                # SM0, whether or not set_auto_transmit raised.
+                with suppress(Exception):
+                    protocol.drain_pending(_STREAM_DRAIN_WINDOW)
+                if previous_kn is not None:
+                    with suppress(Exception):
+                        self.set_sampling_interval(previous_kn)
+
     def get_calibration(self) -> float:
         """Inspect the calibration factor (``IC`` command).
 
@@ -267,3 +414,70 @@ class DTM151Serial:
     def erase_scale(self) -> None:
         """Reset the scale factor to 1 on all ranges (``EL`` command)."""
         self._protocol.send_setter(commands.EL)
+
+
+class FieldStream:
+    """Iterator over field readings from an ``SM1``-enabled device.
+
+    Created internally by :meth:`DTM151Serial.stream_field` — you don't
+    instantiate this directly. Each iteration blocks up to ``timeout``
+    seconds for the next device-originated reading.
+
+    Example::
+
+        with dtm.stream_field(rate_hz=10) as stream:
+            for reading in stream:
+                plot(reading)
+                if done:
+                    break
+
+    For interleaving other commands without desyncing the bus, use
+    :meth:`paused`::
+
+        with dtm.stream_field(rate_hz=10) as stream:
+            for reading in stream:
+                if time_for_temp():
+                    with stream.paused():
+                        temp = dtm.read_temperature()
+    """
+
+    def __init__(self, protocol: Group3Protocol, timeout: float) -> None:
+        self._protocol = protocol
+        self._timeout = timeout
+        self._paused = False
+
+    def __iter__(self) -> FieldStream:
+        return self
+
+    def __next__(self) -> Reading:
+        if self._paused:
+            raise RuntimeError(
+                "FieldStream is paused — exit the paused() block before iterating"
+            )
+        reply = self._protocol.read_next(self._timeout)
+        return parse_reading(reply)
+
+    @contextmanager
+    def paused(self) -> Iterator[None]:
+        """Pause streaming so the caller can send request/reply commands.
+
+        Sends ``SM0`` and drains any reply that was already in flight, then
+        on exit sends ``SM1`` again. Inside the block, the iterator is
+        disabled — calling ``next(stream)`` raises ``RuntimeError``.
+        """
+        if self._paused:
+            raise RuntimeError("FieldStream is already paused")
+        # SMn is documented as producing no reply (DTM-151 Commands v7.1).
+        # Use send_no_reply rather than send_setter so the setter-drain does
+        # not accidentally consume an in-flight streaming reading as an
+        # "unexpected setter reply". drain_pending below handles cleanup.
+        self._protocol.send_no_reply(commands.SM0)
+        self._protocol.drain_pending(_STREAM_DRAIN_WINDOW)
+        self._paused = True
+        try:
+            yield
+        finally:
+            try:
+                self._protocol.send_no_reply(commands.SM1)
+            finally:
+                self._paused = False

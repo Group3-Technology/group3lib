@@ -27,6 +27,7 @@ from group3.exceptions import CommandError
 F: Final = "F"  # Field reading — current selected range.
 P: Final = "P"  # Peak hold field reading.
 Q: Final = "Q"  # Reset peak hold.
+T: Final = "T"  # Temperature reading from the probe's temperature sensor.
 
 Z: Final = "Z"  # Zero the currently selected range.
 EZ: Final = "EZ"  # Erase zero (cancel zero correction on current range).
@@ -50,6 +51,7 @@ IC: Final = "IC"  # Inspect calibration factor (mantissa + exponent).
 ID: Final = "ID"  # Inspect filter state: "0" (off) or "1" (on).
 IG: Final = "IG"  # Inspect general function: "D"/"A" + "C"/"V".
 IJ: Final = "IJ"  # Inspect filter factor (J).
+IK: Final = "IK"  # Inspect sampling interval (seconds); 0 = max rate (10 Hz).
 IY: Final = "IY"  # Inspect filter window half-width.
 IZ: Final = "IZ"  # Inspect zero offset.
 IR: Final = "IR"  # Inspect range index: "0".."3".
@@ -67,6 +69,10 @@ R3: Final = "R3"  # Select 3.0 T range.
 NH: Final = "NH"  # Display mode: hold (peak).
 NN: Final = "NN"  # Display mode: normal (field).
 NT: Final = "NT"  # Display mode: temperature.
+
+# Send-mode / streaming control (DTM-151 Commands v7.1, Send Mode row).
+SM0: Final = "SM0"  # Send mode: F-Request. Device replies only when host sends F.
+SM1: Final = "SM1"  # Send mode: Timed. Device auto-transmits every Kn seconds.
 
 
 # -----------------------------------------------------------------------------
@@ -157,6 +163,45 @@ def y_set_filter_window(value: float) -> str:
     if fvalue <= 0:
         raise CommandError(f"filter window must be positive, got {value}")
     return f"Y{_format_number(fvalue)}"
+
+
+def sm_set_send_mode(enabled: bool) -> str:
+    """Build the ``SMn`` send-mode command (DTM-151 Commands v7.1).
+
+    Args:
+        enabled: ``True`` selects ``SM1`` (Timed — device auto-transmits every
+            ``Kn`` seconds). ``False`` selects ``SM0`` (F-Request — device only
+            replies when the host sends ``F``; this is the default).
+
+    Returns:
+        ``"SM1"`` or ``"SM0"``.
+    """
+    if not isinstance(enabled, bool):
+        raise CommandError(f"enabled must be bool, got {type(enabled).__name__}")
+    return SM1 if enabled else SM0
+
+
+def k_set_sampling_rate(seconds: int) -> str:
+    """Build the ``Kn`` sampling-rate command (DTM-151 Commands v7.1).
+
+    Controls how often the device auto-transmits a reading when ``SM1`` is
+    active. ``0`` means "every reading" — the internal 10 Hz measurement
+    rate. Larger values throttle: ``K1`` = 1 s between readings, ``K60`` =
+    1-minute interval, etc.
+
+    Args:
+        seconds: Sampling interval in seconds, 0..65534.
+
+    Raises:
+        CommandError: ``seconds`` is out of range.
+    """
+    if not isinstance(seconds, int) or isinstance(seconds, bool):
+        raise CommandError(
+            f"sampling rate must be int, got {type(seconds).__name__}"
+        )
+    if not 0 <= seconds <= 65534:
+        raise CommandError(f"sampling rate must be 0..65534, got {seconds}")
+    return f"K{seconds}"
 
 
 def sc_set_calibration(factor: float) -> str:

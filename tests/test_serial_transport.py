@@ -214,6 +214,37 @@ class TestTimeout:
             t.request(b"F\r")
 
 
+class TestReadReply:
+    """SerialTransport.read_reply — blocking read used by streaming consumers."""
+
+    def test_full_reply_returned(self, fake_serial: _FakeSerialModule) -> None:
+        t = _transport()
+        t.open()
+        assert fake_serial.last_instance is not None
+        fake_serial.last_instance.queue_rx(b" 0.10T\r")
+        assert t.read_reply(timeout=0.1) == b" 0.10T\r"
+
+    def test_no_data_raises_timeout(self, fake_serial: _FakeSerialModule) -> None:
+        t = _transport(timeout=0.05)
+        t.open()
+        with pytest.raises(TimeoutError, match="no reply"):
+            t.read_reply(timeout=0.05)
+
+    def test_partial_reply_raises_timeout(self, fake_serial: _FakeSerialModule) -> None:
+        t = _transport(timeout=0.05)
+        t.open()
+        assert fake_serial.last_instance is not None
+        fake_serial.last_instance.queue_rx(b" 0.10")  # no terminator
+        with pytest.raises(TimeoutError, match="partial reply"):
+            t.read_reply(timeout=0.05)
+
+    def test_rejects_negative_timeout(self, fake_serial: _FakeSerialModule) -> None:
+        t = _transport()
+        t.open()
+        with pytest.raises(ValueError):
+            t.read_reply(timeout=-0.1)
+
+
 class TestReadOptional:
     """Cover the drain path used by Group3Protocol.send_setter()."""
 

@@ -68,12 +68,14 @@ _ERROR_TABLE: Final[tuple[tuple[str, type[DeviceError]], ...]] = (
     ("RESET", ResetError),
 )
 
-# ``-?\d+(\.\d*)?([eE][+-]?\d+)?`` matches both plain decimals and exponential floats.
+# ``-?\d+(\.\d*)?([eE][+-]?\d+)?`` matches both plain decimals and exponential
+# floats. The optional unit suffix accepts ``T`` / ``G`` / ``kG`` for field
+# replies and ``C`` for temperature replies from the ``T`` command.
 _NUMBER_RE: Final = re.compile(
     r"""^\s*
         (?P<value>[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?)
         \s*
-        (?P<unit>[TGkK]?[Gg]?)?
+        (?P<unit>kG|[TGCtgc])?
         \s*$
     """,
     re.VERBOSE,
@@ -214,4 +216,6 @@ def _unit_from_suffix(text: str) -> Unit:
         return Unit.GAUSS
     if normalised == "kg":
         return Unit.KILOGAUSS
+    if normalised == "c":
+        return Unit.CELSIUS
     return Unit.UNKNOWN

@@ -96,6 +96,17 @@ class TestParseReading:
         assert r.value == pytest.approx(-3.4e-2)
         assert r.unit is Unit.TESLA
 
+    def test_celsius_suffix(self) -> None:
+        """Temperature replies use a C suffix (DTM-151 Commands v7.1, T row)."""
+        r = parse_reading(" 23.5C")
+        assert r.value == pytest.approx(23.5)
+        assert r.unit is Unit.CELSIUS
+
+    def test_celsius_negative(self) -> None:
+        r = parse_reading(" -5.0C")
+        assert r.value == pytest.approx(-5.0)
+        assert r.unit is Unit.CELSIUS
+
     def test_rejects_malformed(self) -> None:
         with pytest.raises(ProtocolError):
             parse_reading(" garbage")
