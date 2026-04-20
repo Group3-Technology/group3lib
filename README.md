@@ -122,6 +122,14 @@ temp = dtm.read_temperature()
 print(f"{temp.value:+.2f} °C")
 ```
 
+Enable unit suffixes in numeric replies and inspect a metadata snapshot:
+
+```python
+dtm.set_send_units(True)          # SU1
+snapshot = dtm.read_metadata_snapshot()
+print(snapshot.range_index, snapshot.filter_enabled, snapshot.sampling_interval)
+```
+
 ## Live streaming (SM1 / Kn)
 
 > **Point-to-point only.** Streaming is not supported on the G3CL addressed
@@ -169,6 +177,9 @@ with dtm.stream_field(interval_seconds=0) as stream:
 See [`examples/live_plot.py`](examples/live_plot.py) for a full matplotlib
 example that streams field at 10 Hz and temperature at 1 Hz simultaneously
 (requires the `[plot]` extra for `matplotlib`).
+
+See [`examples/log_stream.py`](examples/log_stream.py) for a VI-inspired TSV
+logger that writes high-rate field rows plus a metadata row every 10 seconds.
 
 ## G3CL multi-drop
 
@@ -233,10 +244,18 @@ Cross-reference:
 | `An` | `session.select(addr)`, `dtm.set_address()` | G3CL addressing |
 | `SMn` | `dtm.set_auto_transmit()`, `dtm.stream_field()` | Auto-transmit (streaming) |
 | `Kn` / `IK` | `dtm.set_sampling_interval()` / `dtm.get_sampling_interval()` | Streaming rate |
+| `SUn` | `dtm.set_send_units()` | Include units in numeric replies |
+
+Higher-level helpers built on those commands:
+
+| Helper | Purpose |
+| --- | --- |
+| `dtm.read_metadata_snapshot()` | Temperature + range + filter + `Kn` + `IG` in one call set |
+| `dtm.run_script(text)` | Execute LabVIEW-style concatenated command scripts such as `SU1IRID` |
 
 Commands from the confidentials reference that are **not yet exposed**:
-`ISF` (firmware version), `ISS` (serial number), `SUn` (send units),
-`SEn` (echo on/off), `WA`/`WE`/`WZ` (raw field inspects), and the entire
+`ISF` (firmware version), `ISS` (serial number), `SEn` (echo on/off),
+`WA`/`WE`/`WZ` (raw field inspects), and the entire
 calibration submenu (factory-only). These are pending confirmation of which
 commands are customer-facing.
 
@@ -263,7 +282,9 @@ Real-hardware smoke tests are manual — see
 [`examples/read_field.py`](examples/read_field.py),
 [`examples/read_temperature.py`](examples/read_temperature.py),
 [`examples/dtm151_walkthrough.py`](examples/dtm151_walkthrough.py), and
-[`examples/live_plot.py`](examples/live_plot.py) — and are not part of the
+[`examples/live_plot.py`](examples/live_plot.py),
+[`examples/log_stream.py`](examples/log_stream.py), and
+[`examples/run_vi_script.py`](examples/run_vi_script.py) — and are not part of the
 automated suite.
 
 ## Assumptions / manual-dependent TODOs

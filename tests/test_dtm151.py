@@ -12,6 +12,7 @@ import pytest
 from group3 import (
     AcquisitionMode,
     CommandError,
+    DeviceMetadataSnapshot,
     DTM151Serial,
     FakeTransport,
     FixedRangeProbeError,
@@ -40,10 +41,14 @@ SENT_IO = b"IO\r"
 SENT_IL = b"IL\r"
 SENT_D0 = b"D0\r"
 SENT_D1 = b"D1\r"
+SENT_SU0 = b"SU0\r"
+SENT_SU1 = b"SU1\r"
 SENT_ID = b"ID\r"
 SENT_IJ = b"IJ\r"
 SENT_IY = b"IY\r"
 SENT_IG = b"IG\r"
+SENT_IK = b"IK\r"
+SENT_T = b"T\r"
 SENT_GA = b"GA\r"
 SENT_GD = b"GD\r"
 SENT_GC = b"GC\r"
@@ -85,6 +90,15 @@ class TestReadings:
     def test_reset_peak_sends_Q(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
         dtm.reset_peak()
         assert fake.sent == [SENT_Q]
+
+    def test_read_temperature_sends_T_and_parses_reply(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.queue_reply(b" 23.5C\r")
+        r = dtm.read_temperature()
+        assert fake.sent == [SENT_T]
+        assert r.value == pytest.approx(23.5)
+        assert r.unit is Unit.CELSIUS
 
 
 # --------------------------------------------------------------------------- #
@@ -214,6 +228,14 @@ class TestFilter:
     def test_filter_off(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
         dtm.set_filter_enabled(False)
         assert fake.sent == [SENT_D0]
+
+    def test_set_send_units_on(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
+        dtm.set_send_units(True)
+        assert fake.sent == [SENT_SU1]
+
+    def test_set_send_units_off(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
+        dtm.set_send_units(False)
+        assert fake.sent == [SENT_SU0]
 
     def test_get_filter_enabled(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
         fake.queue_reply(b" 1\r")
@@ -351,3 +373,74 @@ class TestAddressingAndCalibration:
         fake.queue_reply(b" 1.0\r")
         assert dtm.get_scale() == pytest.approx(1.0)
         assert fake.sent == [SENT_IL]
+
+
+class TestMetadataSnapshot:
+    def test_reads_snapshot_with_temperature(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.queue_reply(b" 22.0C\r")
+        fake.queue_reply(b" 2\r")
+        fake.queue_reply(b" 1\r")
+        fake.queue_reply(b" 0\r")
+        fake.queue_reply(b" DC\r")
+        snapshot = dtm.read_metadata_snapshot()
+        assert isinstance(snapshot, DeviceMetadataSnapshot)
+        assert snapshot.temperature is not None
+        assert snapshot.temperature.value == pytest.approx(22.0)
+        assert snapshot.range_index == 2
+        assert snapshot.filter_enabled is True
+        assert snapshot.sampling_interval == 0
+        assert snapshot.status.measurement is MeasurementMode.DC
+        assert fake.sent == [SENT_T, SENT_IR, SENT_ID, SENT_IK, SENT_IG]
+
+    def test_snapshot_tolerates_missing_temperature_probe(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.queue_reply(b" NO TEMPERATURE PROBE\r")
+        fake.queue_reply(b" 3\r")
+        fake.queue_reply(b" 0\r")
+        fake.queue_reply(b" 60\r")
+        fake.queue_reply(b" AV\r")
+        snapshot = dtm.read_metadata_snapshot()
+        assert snapshot.temperature is None
+        assert snapshot.range_index == 3
+        assert snapshot.filter_enabled is False
+        assert snapshot.sampling_interval == 60
+        assert snapshot.status.acquisition is AcquisitionMode.TRIGGERED
+
+
+class TestScriptRunner:
+    def test_run_script_executes_labview_style_concatenated_commands(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.scripted(
+            [
+                (SENT_SU1, b""),
+                (SENT_IR, b" 2\r"),
+                (SENT_ID, b" 1\r"),
+            ]
+        )
+        results = dtm.run_script("SU1IRID")
+        assert [result.command for result in results] == ["SU1", "IR", "ID"]
+        assert [result.reply for result in results] == [None, " 2", " 1"]
+        assert fake.sent == [SENT_SU1, SENT_IR, SENT_ID]
+
+    def test_run_script_ignores_header_lines_and_whitespace(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.scripted(
+            [
+                (SENT_SU1, b""),
+                (SENT_IR, b" 2\r"),
+                (SENT_ID, b" 0\r"),
+            ]
+        )
+        script = "STANDARD.TXT\n  SU1 IR ID  \n"
+        results = dtm.run_script(script)
+        assert [result.command for result in results] == ["SU1", "IR", "ID"]
+        assert [result.reply for result in results] == [None, " 2", " 0"]
+
+    def test_run_script_rejects_unparseable_text(self, dtm: DTM151Serial) -> None:
+        with pytest.raises(CommandError, match="Could not parse"):
+            dtm.run_script("HELLO")

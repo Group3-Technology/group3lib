@@ -60,10 +60,12 @@ from group3.transport.fake import FakeTransport
 from group3.transport.serial import SerialTransport
 from group3.types import (
     AcquisitionMode,
+    DeviceMetadataSnapshot,
     DeviceStatus,
     MeasurementMode,
     RangeIndex,
     Reading,
+    ScriptCommandResult,
     Unit,
 )
 
@@ -77,6 +79,7 @@ __all__ = [
     "DTM151Serial",
     "DataCarrierError",
     "DeviceError",
+    "DeviceMetadataSnapshot",
     "DeviceOverflowError",
     "DeviceStatus",
     "DivideByZeroError",
@@ -100,6 +103,7 @@ __all__ = [
     "RangeIndex",
     "Reading",
     "ResetError",
+    "ScriptCommandResult",
     "SerialTransport",
     "TimeoutError",
     "Transport",

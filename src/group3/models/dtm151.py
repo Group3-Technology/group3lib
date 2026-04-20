@@ -12,12 +12,17 @@ The class accepts any object that exposes ``send(str, timeout)`` and
 
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from typing import Protocol, runtime_checkable
 
-from group3.exceptions import CommandError
+from group3.exceptions import (
+    BadTemperatureReadingError,
+    CommandError,
+    NoTemperatureProbeError,
+)
 from group3.protocol import commands
 from group3.protocol.core import Group3Protocol
 from group3.protocol.parser import (
@@ -27,7 +32,7 @@ from group3.protocol.parser import (
     parse_reading,
     parse_status,
 )
-from group3.types import DeviceStatus, Reading
+from group3.types import DeviceMetadataSnapshot, DeviceStatus, Reading, ScriptCommandResult
 
 
 @runtime_checkable
@@ -60,6 +65,28 @@ _DEFAULT_STREAM_TIMEOUT: float = 2.0
 # was already mid-transmission, short enough that it doesn't slow the user
 # down. 50 ms comfortably absorbs a ~20-byte reply at 9600 baud.
 _STREAM_DRAIN_WINDOW: float = 0.05
+
+_SCRIPT_NUMBER_RE = r"[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?"
+_SCRIPT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"SM[01]"),
+    re.compile(r"SU[01]"),
+    re.compile(
+        r"(?:D[01]|EZ|EP|EO|EC|EL|GA|GD|GC|GV|IC|ID|IG|IJ|IK|IY|IZ|IR|IO|IL|IN|NH|NN|NT)"
+    ),
+    re.compile(r"[FPQTZV]"),
+    re.compile(r"R[0-3]"),
+    re.compile(r"A(?:[0-9]|[12][0-9]|30)"),
+    re.compile(r"J[0-9]+"),
+    re.compile(r"K[0-9]+"),
+    re.compile(rf"SC{_SCRIPT_NUMBER_RE}"),
+    re.compile(rf"Y{_SCRIPT_NUMBER_RE}"),
+    re.compile(rf"O{_SCRIPT_NUMBER_RE}"),
+)
+
+_SCRIPT_REQUEST_COMMANDS = frozenset(
+    {"F", "P", "T", "IC", "ID", "IG", "IJ", "IK", "IY", "IZ", "IR", "IO", "IL", "IN"}
+)
+_SCRIPT_WRITE_ONLY_COMMANDS = frozenset({"V", "SM0", "SM1"})
 
 
 class DTM151Serial:
@@ -105,6 +132,37 @@ class DTM151Serial:
         """
         reply = self._protocol.send(commands.T)
         return parse_reading(reply)
+
+    def set_send_units(self, enabled: bool) -> None:
+        """Enable or disable unit suffixes in numeric replies (``SU1`` / ``SU0``)."""
+        self._protocol.send_setter(commands.su_set_send_units(enabled))
+
+    def read_metadata_snapshot(
+        self,
+        include_temperature: bool = True,
+    ) -> DeviceMetadataSnapshot:
+        """Read a compact metadata snapshot for logging or status displays.
+
+        The snapshot mirrors the operator-facing information the LabVIEW app logs
+        alongside streaming field data: current range, filter state, sampling
+        interval, acquisition/mode status, and temperature when available.
+        Temperature-probe absence or invalid-temperature faults are tolerated and
+        represented as ``temperature=None`` so callers can log a ``?`` placeholder
+        rather than aborting an acquisition.
+        """
+        temperature: Reading | None = None
+        if include_temperature:
+            try:
+                temperature = self.read_temperature()
+            except (BadTemperatureReadingError, NoTemperatureProbeError):
+                temperature = None
+        return DeviceMetadataSnapshot(
+            range_index=self.get_range(),
+            filter_enabled=self.get_filter_enabled(),
+            sampling_interval=self.get_sampling_interval(),
+            status=self.get_status(),
+            temperature=temperature,
+        )
 
     def reset_peak(self) -> None:
         """Reset the peak-hold value to zero (``Q`` command)."""
@@ -305,6 +363,30 @@ class DTM151Serial:
         reply = self._protocol.send(commands.IK)
         return parse_int(reply)
 
+    def run_script(self, script: str) -> list[ScriptCommandResult]:
+        """Execute a LabVIEW-style concatenated command script.
+
+        The LabVIEW DTM-151 application ships ``Standard.txt`` / ``Custom*.txt``
+        files containing bare concatenations like ``SU1IRID``. This helper parses
+        those command streams line-by-line, ignores comment/header lines, and
+        executes each command in sequence using the same protocol rules as the
+        normal Python API.
+        """
+        results: list[ScriptCommandResult] = []
+        for line in script.splitlines():
+            stripped = line.strip()
+            if stripped == "" or stripped.startswith("#") or ".TXT" in stripped.upper():
+                continue
+            remaining = "".join(ch for ch in stripped if not ch.isspace())
+            while remaining:
+                command = _parse_script_command(remaining)
+                results.append(self._execute_script_command(command))
+                remaining = remaining[len(command) :]
+        return results
+
+    def _execute_script_command(self, command: str) -> ScriptCommandResult:
+        return _execute_script_command_on_protocol(self._protocol, command)
+
     @contextmanager
     def stream_field(
         self,
@@ -425,7 +507,7 @@ class FieldStream:
 
     Example::
 
-        with dtm.stream_field(rate_hz=10) as stream:
+        with dtm.stream_field(interval_seconds=0) as stream:
             for reading in stream:
                 plot(reading)
                 if done:
@@ -434,7 +516,7 @@ class FieldStream:
     For interleaving other commands without desyncing the bus, use
     :meth:`paused`::
 
-        with dtm.stream_field(rate_hz=10) as stream:
+        with dtm.stream_field(interval_seconds=0) as stream:
             for reading in stream:
                 if time_for_temp():
                     with stream.paused():
@@ -481,3 +563,65 @@ class FieldStream:
                 self._protocol.send_no_reply(commands.SM1)
             finally:
                 self._paused = False
+
+
+def _parse_script_command(text: str) -> str:
+    for pattern in _SCRIPT_PATTERNS:
+        match = pattern.match(text)
+        if match is not None:
+            return match.group(0)
+    raise CommandError(f"Could not parse script command at {text!r}")
+
+
+def _script_command_requires_reply(command: str) -> bool:
+    return command in _SCRIPT_REQUEST_COMMANDS
+
+
+def _script_command_is_write_only(command: str) -> bool:
+    return command in _SCRIPT_WRITE_ONLY_COMMANDS or command.startswith("A")
+
+
+def _validate_script_command(command: str) -> None:
+    if command.startswith("R"):
+        commands.r_set_range(int(command[1:]))
+    elif command.startswith("A"):
+        commands.a_set_address(int(command[1:]))
+    elif command.startswith("J"):
+        commands.j_set_filter_factor(int(command[1:]))
+    elif command.startswith("K"):
+        commands.k_set_sampling_rate(int(command[1:]))
+    elif command.startswith("SC"):
+        commands.sc_set_calibration(float(command[2:]))
+    elif command.startswith("Y"):
+        commands.y_set_filter_window(float(command[1:]))
+    elif command.startswith("O"):
+        commands.o_set_offset(float(command[1:]))
+    elif command.startswith("SU"):
+        commands.su_set_send_units(command == "SU1")
+    elif command.startswith("SM"):
+        commands.sm_set_send_mode(command == "SM1")
+
+
+def _is_parameterised_command(command: str) -> bool:
+    return command.startswith(("R", "A", "J", "K", "SC", "Y", "O", "SU", "SM"))
+
+
+def _normalise_script_command(command: str) -> str:
+    if not _is_parameterised_command(command):
+        return command
+    _validate_script_command(command)
+    return command
+
+
+def _execute_script_command_on_protocol(
+    protocol: _ProtocolLike,
+    command: str,
+) -> ScriptCommandResult:
+    normalised = _normalise_script_command(command)
+    if _script_command_requires_reply(normalised):
+        return ScriptCommandResult(command=normalised, reply=protocol.send(normalised))
+    if _script_command_is_write_only(normalised):
+        protocol.send_no_reply(normalised)
+        return ScriptCommandResult(command=normalised, reply=None)
+    protocol.send_setter(normalised)
+    return ScriptCommandResult(command=normalised, reply=None)

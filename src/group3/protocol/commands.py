@@ -181,6 +181,18 @@ def sm_set_send_mode(enabled: bool) -> str:
     return SM1 if enabled else SM0
 
 
+def su_set_send_units(enabled: bool) -> str:
+    """Build the ``SUn`` send-units command (DTM-151 Commands v7.1).
+
+    Args:
+        enabled: ``True`` selects ``SU1`` so numeric replies include unit suffixes
+            (e.g., ``T``, ``G``, ``C`` when applicable). ``False`` selects ``SU0``.
+    """
+    if not isinstance(enabled, bool):
+        raise CommandError(f"enabled must be bool, got {type(enabled).__name__}")
+    return "SU1" if enabled else "SU0"
+
+
 def k_set_sampling_rate(seconds: int) -> str:
     """Build the ``Kn`` sampling-rate command (DTM-151 Commands v7.1).
 

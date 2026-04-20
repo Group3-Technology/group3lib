@@ -68,6 +68,41 @@ class Reading:
 
 
 @dataclass(frozen=True, slots=True)
+class DeviceMetadataSnapshot:
+    """A lightweight metadata snapshot for logging and monitoring.
+
+    Attributes:
+        range_index: Current DTM-151 range index from ``IR``.
+        filter_enabled: Digital-filter state from ``ID``.
+        sampling_interval: Current ``Kn`` sampling interval in seconds from ``IK``.
+        status: Current DC/AC + continuous/triggered mode from ``IG``.
+        temperature: Most recent probe-temperature reading from ``T`` when available,
+            else ``None`` for probes without temperature support or with an invalid
+            temperature sensor reading.
+    """
+
+    range_index: int
+    filter_enabled: bool
+    sampling_interval: int
+    status: DeviceStatus
+    temperature: Reading | None
+
+
+@dataclass(frozen=True, slots=True)
+class ScriptCommandResult:
+    """One command executed by :meth:`group3.DTM151Serial.run_script`.
+
+    Attributes:
+        command: The exact command text sent on the wire, without terminator.
+        reply: The normalised reply string for request/reply commands, or ``None``
+            for silent-success setters and write-only commands.
+    """
+
+    command: str
+    reply: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class DeviceStatus:
     """Decoded reply from the ``IG`` inspect-general command.
 
