@@ -94,12 +94,27 @@ class Group3Protocol:
         """
         payload = codec.encode(command, self.terminator)
         effective_timeout = timeout if timeout is not None else self.timeout
+        # Single deadline shared by the initial request() and any residue-
+        # draining read_reply() calls below, so a caller asking for
+        # send(timeout=1.0) sees roughly 1 s of total wall-clock cost — not
+        # 2 s when residue happens to be queued.
+        deadline = (
+            time.monotonic() + effective_timeout
+            if effective_timeout is not None
+            else None
+        )
+
+        def _remaining() -> float | None:
+            if deadline is None:
+                return None
+            return max(0.0, deadline - time.monotonic())
+
         # Compose the full outgoing sequence up-front so debug state is correct
         # regardless of whether transport.request() succeeds, raises, or the
         # reply parses as an error.
         full_tx = bytes(self._pending_tx) + payload
         try:
-            raw = self.transport.request(payload, timeout=effective_timeout)
+            raw = self.transport.request(payload, timeout=_remaining())
         except BaseException:
             # Record the attempted TX so callers inspecting last_raw_tx after
             # catching the exception can see exactly what went on the wire.
@@ -111,8 +126,71 @@ class Group3Protocol:
         self._pending_tx.clear()
         self._last = _LastExchange(tx=full_tx, rx=raw)
         reply = codec.strip_terminators(codec.decode(raw))
+        if reply == "":
+            # Leading terminator residue (stale setter acks from prior
+            # send_setter(error_window=0) calls, an undrained An-prefix ack,
+            # or a multi-byte terminator that overflowed into a second frame).
+            # Drain any number of terminator-only frames until we see real
+            # data or the *shared* deadline expires.
+            accumulated_rx = bytearray(raw)
+            while reply == "":
+                remaining = _remaining()
+                if remaining is not None and remaining <= 0:
+                    raise Group3TimeoutError(
+                        f"Timed out after {effective_timeout}s with no real "
+                        "reply (only terminator residue arrived)"
+                    )
+                # read_reply requires a concrete float; with no caller-supplied
+                # timeout, fall back to 1 s per drain attempt (same behaviour
+                # as the previous fallback constant).
+                next_raw = self.transport.read_reply(
+                    remaining if remaining is not None else 1.0
+                )
+                accumulated_rx.extend(next_raw)
+                self._last = _LastExchange(tx=full_tx, rx=bytes(accumulated_rx))
+                reply = codec.strip_terminators(codec.decode(next_raw))
         check_error(reply)
         return reply
+
+    def drain_setter_ack(self, window: float = DEFAULT_SETTER_ERROR_WINDOW) -> None:
+        """Synchronously drain a single setter-style ack from the transport.
+
+        Used by :class:`AddressedProtocol` after writing the ``An`` prefix
+        via :meth:`send_no_reply`: the prefix command empirically acks with
+        a bare terminator (like every other DTM-151-S setter), and if that
+        ack is left on the wire it gets read as the start of the next
+        command's reply — a desync that returns ``""`` instead of the real
+        data.
+
+        Differences from :meth:`send_setter`:
+
+        * No write — ``send_no_reply`` already wrote the command.
+        * ``_pending_tx`` is **not** cleared, so the caller's audit trail
+          (``last_raw_tx``) still includes the prefix and the next command
+          as one combined exchange.
+        * The drained bytes update ``last_raw_rx`` for debugging.
+
+        If the drained reply is a §4.5.3 error string the corresponding
+        :class:`DeviceError` is raised — the addressed device rejected the
+        prefix command. A non-empty, non-error reply raises
+        :class:`ProtocolError` because the wire is now out of sync.
+        """
+        if window <= 0:
+            return
+        raw = self.transport.read_optional(window)
+        if not raw:
+            return
+        # Update only the rx side; preserve _last.tx and _pending_tx so the
+        # audit trail of the surrounding exchange (e.g. ``An\rF\r``) is intact.
+        self._last = _LastExchange(tx=self._last.tx, rx=raw)
+        reply = codec.strip_terminators(codec.decode(raw))
+        if reply == "":
+            return  # Bare-terminator ack — the desired path.
+        check_error(reply)
+        raise ProtocolError(
+            f"Unexpected reply during ack drain: {reply!r}",
+            raw=raw,
+        )
 
     def drain_pending(self, window: float = 0.05) -> list[bytes]:
         """Drain any in-flight replies from the transport.
@@ -220,8 +298,13 @@ class Group3Protocol:
         Args:
             command: Setter command, without terminator.
             error_window: Seconds to wait for a deferred error or ack reply.
-                Default 50 ms. Set to 0 to skip the drain (fastest, but defers
-                error detection to the next read-producing command).
+                Default 50 ms. Set to 0 to skip the drain entirely — the
+                bare-terminator ack is then left on the wire, which on real
+                hardware is racy and on :class:`FakeTransport` is a guaranteed
+                desync. The next read can return ``""`` (the stale ack) instead
+                of real data; :meth:`send` defends against this by reading
+                again on a terminator-only frame, but other consumers may not.
+                Prefer the default unless you have measured the latency cost.
 
         Raises:
             CommandError: ``command`` is not ASCII.

@@ -19,11 +19,17 @@ SENT_F = b"F\r"
 SENT_V = b"V\r"
 SENT_R2 = b"R2\r"
 
+# Real DTM-151-S setters (including the ``An`` prefix) ack with a bare LF.
+# AddressedProtocol drains this synchronously after every An so the next
+# read isn't desynced — tests must queue it to mirror hardware.
+AN_ACK = b"\n"
+
 
 class TestAddressedProtocol:
     def test_addressed_send_prefixes_address(self) -> None:
         fake = FakeTransport()
         fake.open()
+        fake.queue_reply(AN_ACK)
         fake.queue_reply(b" 1.2345T\r")
         protocol = Group3Protocol(fake)
         session = G3CLSession(protocol)
@@ -45,6 +51,7 @@ class TestAddressedProtocol:
     def test_device_helper_returns_addressed_dtm151(self) -> None:
         fake = FakeTransport()
         fake.open()
+        fake.queue_reply(AN_ACK)
         fake.queue_reply(b" 0.1T\r")
         protocol = Group3Protocol(fake)
         session = G3CLSession(protocol)
@@ -57,6 +64,7 @@ class TestAddressedProtocol:
         """Addressed send must expose A<n> + command in last_raw_tx for debugging."""
         fake = FakeTransport()
         fake.open()
+        fake.queue_reply(AN_ACK)
         fake.queue_reply(b" 1.2T\r")
         protocol = Group3Protocol(fake)
         session = G3CLSession(protocol)
@@ -76,6 +84,7 @@ class TestAddressedProtocol:
         session = G3CLSession(protocol)
         session.broadcast_trigger()
         assert protocol.last_raw_tx == b"V\r"
+        fake.queue_reply(AN_ACK)
         fake.queue_reply(b" 0.1T\r")
         session.select(0).send("F")
         # The addressed send flushes everything since the last reply: V, A0, F.
@@ -88,14 +97,16 @@ class TestAddressedProtocol:
         fake.open()
         protocol = Group3Protocol(fake)
         session = G3CLSession(protocol)
-        # Arrange: A5 writes succeed (write_only), F read raises a TimeoutError.
+        # Arrange: A5 ack succeeds (drained), F read raises a TimeoutError.
         from group3 import TimeoutError as G3TimeoutError
+        fake.queue_reply(AN_ACK)
         fake.queue_error(G3TimeoutError("simulated"))
         with pytest.raises(G3TimeoutError):
             session.select(5).send("F")
         # The failed attempt's bytes are captured for inspection.
         assert protocol.last_raw_tx == b"A5\rF\r"
         # A later successful exchange must NOT include any leaked A5\rF\r.
+        fake.queue_reply(AN_ACK)
         fake.queue_reply(b" 0.5T\r")
         session.select(10).send("F")
         assert protocol.last_raw_tx == b"A10\rF\r"
@@ -104,7 +115,9 @@ class TestAddressedProtocol:
         """Pending bytes clear after every send() that produces a reply."""
         fake = FakeTransport()
         fake.open()
+        fake.queue_reply(AN_ACK)
         fake.queue_reply(b" 0.1T\r")
+        fake.queue_reply(AN_ACK)
         fake.queue_reply(b" 0.2T\r")
         protocol = Group3Protocol(fake)
         session = G3CLSession(protocol)
@@ -117,11 +130,13 @@ class TestAddressedProtocol:
     def test_address_boundaries(self) -> None:
         fake = FakeTransport()
         fake.open()
+        # An ack arrives between the address byte and the R2 reply, mirroring
+        # the bare-LF setter ack the device sends for every command.
         fake.scripted(
             [
-                (SENT_A0, b" \r"),
+                (SENT_A0, AN_ACK),
                 (SENT_R2, b" \r"),
-                (SENT_A30, b" \r"),
+                (SENT_A30, AN_ACK),
                 (SENT_R2, b" \r"),
             ]
         )
@@ -129,6 +144,46 @@ class TestAddressedProtocol:
         session = G3CLSession(protocol)
         session.select(0).send("R2")
         session.select(30).send("R2")
+
+    def test_addressed_send_does_not_consume_command_reply_as_address_ack(
+        self,
+    ) -> None:
+        """Regression: An's bare-LF ack must be drained synchronously so that
+        the next command's reply isn't returned as an empty string.
+
+        Before the drain_setter_ack fix, AddressedProtocol.send issued An via
+        send_no_reply and then immediately read the next byte as the F reply
+        — which was actually the A5 ack ``\\n``, returning ``""`` and leaving
+        the real F reply queued for the next command to consume.
+        """
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_reply(AN_ACK)
+        fake.queue_reply(b" 1.2T\r")
+        protocol = Group3Protocol(fake)
+        session = G3CLSession(protocol)
+        # If An's ack leaks into F's read, this returns "" and asserts on the
+        # next exchange would see a stale ` 1.2T` reply.
+        assert session.select(5).send("F") == " 1.2T"
+
+    def test_addressed_send_setter_does_not_mask_setter_error(self) -> None:
+        """Regression: An's ack must be drained before send_setter so that a
+        setter's deferred error string isn't masked by the An ack arriving
+        first.
+
+        Pre-fix: send_setter would consume the An ack as ``b'\\n'``, decide
+        the setter succeeded silently, and leave the real ``NO PROBE`` error
+        on the wire to confuse the next command.
+        """
+        from group3 import NoProbeError
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_reply(AN_ACK)            # An prefix ack — drained
+        fake.queue_reply(b" NO PROBE\r")    # Z setter's error reply
+        protocol = Group3Protocol(fake)
+        session = G3CLSession(protocol)
+        with pytest.raises(NoProbeError):
+            session.select(5).send_setter("Z")
 
 
 class TestBroadcastTrigger:
@@ -157,10 +212,10 @@ class TestBroadcastTrigger:
             [
                 # The broadcast V is write-only (no reply) — empty reply bytes.
                 (SENT_V, b""),
-                # Then we read device 0 then device 5.
-                (SENT_A0, b""),
+                # Each addressed read: An prefix acks with bare LF, then F reply.
+                (SENT_A0, AN_ACK),
                 (SENT_F, b" 0.10T\r"),
-                (SENT_A5, b""),
+                (SENT_A5, AN_ACK),
                 (SENT_F, b" 0.25T\r"),
             ]
         )

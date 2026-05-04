@@ -160,6 +160,118 @@ class TestSendSetter:
         # The error reply is still in the queue; caller could pick it up later.
         assert list(fake._replies) == [b" NO PROBE\r"]
 
+    def test_error_window_zero_then_send_recovers_from_stale_ack(self) -> None:
+        """Regression: send_setter(error_window=0) leaves the bare-LF ack on
+        the wire. The next send() must read past that residue and return the
+        real reply rather than ``""``.
+        """
+        fake = FakeTransport()
+        fake.open()
+        # Stale ack from the prior setter, then F's actual reply.
+        fake.queue_reply(b"\n")
+        fake.queue_reply(b" 1.234T\r")
+        p = Group3Protocol(fake)
+        p.send_setter("Z", error_window=0)
+        # Without the leading-residue tolerance in send(), this returned ""
+        # because the stale ack was consumed as F's reply.
+        assert p.send("F") == " 1.234T"
+
+    def test_send_skips_multiple_terminator_only_frames(self) -> None:
+        """Regression: send() must drain *any number* of stale terminator
+        frames before returning. The original tolerance only skipped one,
+        so two queued ``b"\\n"`` acks before the real reply still produced
+        ``""``.
+        """
+        fake = FakeTransport()
+        fake.open()
+        # Two stale acks from prior setters, then the real F reply.
+        fake.queue_reply(b"\n")
+        fake.queue_reply(b"\n")
+        fake.queue_reply(b" 1.234T\r")
+        p = Group3Protocol(fake)
+        p.send_setter("Z", error_window=0)
+        p.send_setter("EZ", error_window=0)
+        assert p.send("F") == " 1.234T"
+
+    def test_send_residue_drain_shares_deadline_with_request(self) -> None:
+        """Regression: send(timeout=T) must total ~T wall-clock time, not 2T.
+
+        Before the shared-deadline fix, the residue-draining read_reply()
+        loop started a fresh ``deadline = now + effective_timeout`` after
+        request() had already consumed up to the full budget — so a stale
+        ack followed by a slow real reply could blow past the caller's
+        timeout by ~100%.
+
+        Each transport call sleeps long enough that, *if* the budget were
+        being shared, the next call would visibly receive less time.
+        With the bug, every call sees a fresh ``timeout`` near the full
+        budget; with the fix, the recorded timeouts strictly decrease.
+        """
+        import time as _time
+
+        from group3.exceptions import TransportError
+
+        sleep_per_call = 0.05  # 50 ms — large enough to dwarf scheduling jitter
+        budget = 1.0
+
+        class _SleepingTransport:
+            """Returns frames after a small sleep, recording each timeout."""
+
+            def __init__(self, frames: list[bytes]) -> None:
+                self._frames = list(frames)
+                self.timeouts: list[float | None] = []
+
+            def open(self) -> None: ...
+            def close(self) -> None: ...
+
+            def request(
+                self, payload: bytes, timeout: float | None = None
+            ) -> bytes:
+                self.timeouts.append(timeout)
+                _time.sleep(sleep_per_call)
+                if not self._frames:
+                    raise TransportError("no frames queued")
+                return self._frames.pop(0)
+
+            def write_only(self, payload: bytes) -> None:
+                raise NotImplementedError
+
+            def read_reply(self, timeout: float) -> bytes:
+                self.timeouts.append(timeout)
+                _time.sleep(sleep_per_call)
+                if not self._frames:
+                    raise TransportError("no frames queued")
+                return self._frames.pop(0)
+
+            def read_optional(self, timeout: float) -> bytes:
+                return b""
+
+            def __enter__(self) -> _SleepingTransport:
+                return self
+
+            def __exit__(self, *exc: object) -> None: ...
+
+        rec = _SleepingTransport([b"\n", b"\n", b" 1.234T\r"])
+        p = Group3Protocol(rec)  # type: ignore[arg-type]
+        wall_start = _time.monotonic()
+        assert p.send("F", timeout=budget) == " 1.234T"
+        wall_elapsed = _time.monotonic() - wall_start
+        assert len(rec.timeouts) == 3, rec.timeouts
+
+        # Each successive call must receive at least sleep_per_call less
+        # budget than the previous — i.e. the deadline is shared, not reset.
+        for i in range(1, len(rec.timeouts)):
+            prev, nxt = rec.timeouts[i - 1], rec.timeouts[i]
+            assert prev is not None and nxt is not None, rec.timeouts
+            assert nxt < prev - sleep_per_call / 2, (
+                f"timeout did not shrink between calls (deadline reset?): "
+                f"{rec.timeouts!r}"
+            )
+        # Total wall-clock cost is ~3 * sleep_per_call = 0.15 s, comfortably
+        # under the 1 s budget — the budget would only matter if the bug
+        # caused us to wait longer than necessary.
+        assert wall_elapsed < budget
+
 
 class TestReadReply:
     """FakeTransport.read_reply: pops queued reply or raises TimeoutError."""
