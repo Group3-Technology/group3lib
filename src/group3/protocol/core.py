@@ -15,9 +15,11 @@ tests and users can inspect them for debugging.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 from group3.exceptions import ProtocolError
+from group3.exceptions import TimeoutError as Group3TimeoutError
 from group3.protocol import codec
 from group3.protocol.parser import check_error
 from group3.transport.base import Transport
@@ -29,11 +31,12 @@ class _LastExchange:
     rx: bytes = b""
 
 
-# Default window to wait after a silent-success setter for a deferred error
-# reply. At 9600 baud, the longest error strings (e.g. "POSITIVE NUMBER
-# REQUIRED", 24 bytes + terminator) need ~26 ms to transmit. 50 ms gives
-# comfortable headroom for processing latency without noticeably slowing a
-# tight loop of setter calls.
+# Default window to wait after a setter for either a bare-terminator ack
+# (empirically what every probed setter sends — see examples/probe_setter_replies.py)
+# or a §4.5.3 error string. At 9600 baud the longest error string ("POSITIVE
+# NUMBER REQUIRED", 24 bytes + terminator) needs ~26 ms to transmit; 50 ms
+# gives comfortable headroom for processing latency without noticeably slowing
+# a tight loop of setter calls.
 DEFAULT_SETTER_ERROR_WINDOW: float = 0.05
 
 
@@ -138,6 +141,11 @@ class Group3Protocol:
         command is written. The terminator is stripped, the reply is checked
         against the §4.5.3 error table, and the cleaned string is returned.
 
+        Tolerates terminator-only frames: if a read returns just terminator
+        bytes (e.g. a stale setter ack `\\n` left in the buffer when
+        streaming begins), this method discards the empty frame and reads
+        again. The total wait still respects ``timeout``.
+
         Args:
             timeout: Seconds to wait for the next reply. If nothing arrives,
                 :class:`TimeoutError` is raised.
@@ -152,14 +160,26 @@ class Group3Protocol:
             ProtocolError: Reply was not valid ASCII.
             DeviceError: The device sent a named error string.
         """
-        raw = self.transport.read_reply(timeout)
-        # Streaming reads don't carry a "request" payload — _pending_tx and
-        # _last.tx are preserved as-is so the last paired TX still reflects
-        # the most recent command the caller issued.
-        self._last = _LastExchange(tx=self._last.tx, rx=raw)
-        reply = codec.strip_terminators(codec.decode(raw))
-        check_error(reply)
-        return reply
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Group3TimeoutError(
+                    f"Timed out after {timeout}s with no real reply "
+                    "(only terminator residue arrived)"
+                )
+            raw = self.transport.read_reply(remaining)
+            # Streaming reads don't carry a "request" payload — _pending_tx
+            # and _last.tx are preserved as-is so the last paired TX still
+            # reflects the most recent command the caller issued.
+            self._last = _LastExchange(tx=self._last.tx, rx=raw)
+            reply = codec.strip_terminators(codec.decode(raw))
+            if reply == "":
+                # Terminator-only residue (e.g. stale setter ack). Skip and
+                # read again until we get real data or the timeout expires.
+                continue
+            check_error(reply)
+            return reply
 
     def send_no_reply(self, command: str) -> None:
         """Send ``command`` via :meth:`Transport.write_only` with no read.
@@ -182,27 +202,32 @@ class Group3Protocol:
         command: str,
         error_window: float = DEFAULT_SETTER_ERROR_WINDOW,
     ) -> None:
-        """Send a setter command that is silent on success (manual §4.5.2).
+        """Send a setter command that carries no payload on success (manual §4.5.2).
 
-        DTM-151-S setters (``Z``, ``Rn``, ``GA``, ``GD``, ``Jn``, etc.) do not
-        reply on success; they emit an error string from manual §4.5.3 only on
-        failure. This method writes the command, then waits up to
-        ``error_window`` seconds for a deferred reply. If bytes arrive they are
-        treated as an error message and raised via :func:`check_error` — a
-        non-error reply raises :class:`ProtocolError` because the protocol is
-        now out of sync.
+        DTM-151-S setters (``Z``, ``Rn``, ``GA``, ``GD``, ``Jn``, etc.) carry no
+        payload on success; they emit an error string from manual §4.5.3 only
+        on failure. The manual describes this as "silent on success", but
+        empirically the bench device acks every setter with a bare terminator
+        (e.g. ``b'\\n'``) — see ``examples/probe_setter_replies.py``. This
+        method writes the command, waits up to ``error_window`` seconds for a
+        deferred reply, and treats the three observed cases as:
+
+        * No bytes, or a terminator-only frame → success.
+        * A §4.5.3 error string → corresponding :class:`DeviceError` raised
+          via :func:`check_error`.
+        * Any other non-empty reply → :class:`ProtocolError` (desync).
 
         Args:
             command: Setter command, without terminator.
-            error_window: Seconds to wait for a deferred error reply. Default
-                50 ms. Set to 0 to skip the drain (fastest, but defers error
-                detection to the next read-producing command).
+            error_window: Seconds to wait for a deferred error or ack reply.
+                Default 50 ms. Set to 0 to skip the drain (fastest, but defers
+                error detection to the next read-producing command).
 
         Raises:
             CommandError: ``command`` is not ASCII.
             TransportError: Underlying I/O failed.
             DeviceError: A deferred error string arrived from the device.
-            ProtocolError: A reply arrived that was not a recognised error.
+            ProtocolError: A non-empty, non-error reply arrived.
         """
         payload = codec.encode(command, self.terminator)
         self.transport.write_only(payload)

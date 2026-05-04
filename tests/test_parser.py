@@ -54,6 +54,17 @@ class TestParseInt:
     def test_positive(self) -> None:
         assert parse_int(" 2") == 2
 
+    def test_decimal_zero_from_ik(self) -> None:
+        # Real device IK reply with sampling interval 0 (max rate).
+        assert parse_int(" 0.") == 0
+
+    def test_decimal_integer_from_ij(self) -> None:
+        # Real device IJ reply with filter factor 15.
+        assert parse_int(" 15.0000") == 15
+
+    def test_decimal_with_zero_fractional(self) -> None:
+        assert parse_int(" 41.0") == 41
+
     def test_rejects_float(self) -> None:
         with pytest.raises(ProtocolError):
             parse_int(" 1.5")

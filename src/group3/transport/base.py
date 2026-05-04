@@ -53,10 +53,11 @@ class Transport(Protocol):
         """Read a reply if the device sends one within ``timeout`` seconds.
 
         Returns ``b""`` if no bytes arrive within the window — used by
-        :meth:`Group3Protocol.send_setter` to detect deferred error replies on
-        setters that are silent on success. If some bytes arrive but don't
-        form a complete terminator-ended reply within the window, the partial
-        bytes are still returned so the protocol layer can decide how to react.
+        :meth:`Group3Protocol.send_setter` to drain either a bare-terminator
+        ack (the device's normal success reply) or a §4.5.3 deferred error
+        string. If some bytes arrive but don't form a complete
+        terminator-ended reply within the window, the partial bytes are still
+        returned so the protocol layer can decide how to react.
 
         Args:
             timeout: Seconds to wait for the first byte; once one arrives the

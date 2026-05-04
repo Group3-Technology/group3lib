@@ -281,11 +281,12 @@ timeout and error-wrapping behaviour.
 Real-hardware smoke tests are manual — see
 [`examples/read_field.py`](examples/read_field.py),
 [`examples/read_temperature.py`](examples/read_temperature.py),
-[`examples/dtm151_walkthrough.py`](examples/dtm151_walkthrough.py), and
+[`examples/dtm151_walkthrough.py`](examples/dtm151_walkthrough.py),
 [`examples/live_plot.py`](examples/live_plot.py),
-[`examples/log_stream.py`](examples/log_stream.py), and
-[`examples/run_vi_script.py`](examples/run_vi_script.py) — and are not part of the
-automated suite.
+[`examples/log_stream.py`](examples/log_stream.py),
+[`examples/run_vi_script.py`](examples/run_vi_script.py), and
+[`examples/probe_setter_replies.py`](examples/probe_setter_replies.py) — and
+are not part of the automated suite.
 
 ## Assumptions / manual-dependent TODOs
 
@@ -295,23 +296,49 @@ visible pages of Table 9 (pages 4-10 / 4-11 render as images that do not
 extract cleanly), we've marked code with `TODO(manual §x.y)` and kept
 implementation narrow. Resolve these against hardware or a clearer manual copy:
 
-- **`IZ` reply format** (`models/dtm151.py::get_zero_offset`) — assumed plain
-  decimal. May actually be mantissa/exponent like `IC`.
-- **`IY` reply format** (`models/dtm151.py::get_filter_window`) — assumed plain
-  decimal.
 - **`Yn` numeric format** (`protocol/commands.py::y_set_filter_window`) — sent
   as a plain decimal (`repr(float)`). The manual's accepted formats are not
   explicit.
 - **`IC` reply delimiter** (`models/dtm151.py::get_calibration`) — Table 9
-  notes "mantissa and exponent" but the delimiter is not visible. Assumed a
-  standard exponential float.
+  notes "mantissa and exponent" but the delimiter is not visible. The bench
+  unit returned `' 1.000000'` (plain decimal) at factor 1.0; non-unit
+  factors may switch to mantissa+exponent and would need re-verification.
+- **`IZ` and `IY` reply formats** — previously listed as TODOs; verified on
+  the bench unit as plain decimal (`' 1.55'`, `' 1.00'`).
 Other inherited assumptions worth confirming on your unit's DIP-switch settings
 (manual section 3.6):
 
-- **Serial params**: default `9600-8-N-1`, no flow control. The DTM-151-S is
-  fully DIP-switch-configurable between 50 and 19200 baud.
-- **Response terminator**: CR by default (S2-2); LF, CR+LF, and LF+CR are
-  accepted by `codec.strip_terminators`.
+- **Serial params**: factory default is `9600 7E2`, no flow control (verified
+  against an Antala bench unit), and `SerialTransport` defaults match. Pass
+  `bytesize=8, parity="N", stopbits=1` for a unit reconfigured to 8N1, or use
+  the `--bytesize/--parity/--stopbits` flags on the example scripts. The
+  DTM-151-S is fully DIP-switch-configurable between 50 and 19200 baud.
+- **Response terminator**: documented options are CR, LF, CR+LF, LF+CR
+  (S2-2 / S2-3). `SerialTransport` drains all consecutive CR/LF bytes after
+  the first terminator, so any documented combination *and* the
+  longer-than-documented sequences observed on real hardware (see Empirical
+  findings below) are handled transparently.
+
+### Empirical findings (verified against real hardware)
+
+- **Setters ack with a bare terminator, not silence.** The manual (§4.5.2)
+  describes setters (`Z`, `Rn`, `GA`, `GD`, `Jn`, `SUn`, `Dn`, `Q`, …) as
+  "silent on success", but every setter probed against a bench DTM-151-S at
+  9600 7E2 acked with `b'\n'`. `Group3Protocol.send_setter` treats both
+  silence and a terminator-only frame as success — see
+  [`examples/probe_setter_replies.py`](examples/probe_setter_replies.py) to
+  re-run the probe on your own unit. A setter that returns a non-empty,
+  non-error reply is still treated as desync (`ProtocolError`).
+- **Numeric replies always carry a decimal point** — even when the value is
+  integer-valued (e.g. `IK` returns `' 0.'`, `IJ` returns `' 15.0000'`).
+  This matches the manual's §4.5.2 rule but contradicts what status-index
+  replies like `IR` (`' 3'`) might suggest. `parse_int` accepts both forms.
+- **Terminator length varies by message type.** Setter acks use 1 byte
+  (`\n`), streaming readings use 2 bytes (`\n\r`), and request-reply
+  responses use 3 bytes (`\n\r\n`) on the bench unit's DIP-switch
+  configuration. Manual §3.6 only documents 1- and 2-byte forms; the
+  transport drains all consecutive terminator bytes after the first to
+  cover any combination transparently.
 
 ## Layer diagram
 

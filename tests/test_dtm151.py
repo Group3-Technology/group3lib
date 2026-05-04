@@ -258,7 +258,9 @@ class TestFilter:
             dtm.set_filter_factor(70000)
 
     def test_get_filter_factor(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
-        fake.queue_reply(b" 41\r")
+        # Real device returns IJ in decimal form (e.g. ' 41.0000') even though
+        # the value is integer-valued. parse_int handles both forms.
+        fake.queue_reply(b" 41.0000\r")
         assert dtm.get_filter_factor() == 41
         assert fake.sent == [SENT_IJ]
 
@@ -385,7 +387,8 @@ class TestMetadataSnapshot:
         fake.queue_reply(b" 22.0C\r")
         fake.queue_reply(b" 2\r")
         fake.queue_reply(b" 1\r")
-        fake.queue_reply(b" 0\r")
+        # Real device returns IK in decimal form (' 0.' for K=0).
+        fake.queue_reply(b" 0.\r")
         fake.queue_reply(b" DC\r")
         snapshot = dtm.read_metadata_snapshot()
         assert isinstance(snapshot, DeviceMetadataSnapshot)
@@ -403,7 +406,7 @@ class TestMetadataSnapshot:
         fake.queue_reply(b" NO TEMPERATURE PROBE\r")
         fake.queue_reply(b" 3\r")
         fake.queue_reply(b" 0\r")
-        fake.queue_reply(b" 60\r")
+        fake.queue_reply(b" 60.\r")
         fake.queue_reply(b" AV\r")
         snapshot = dtm.read_metadata_snapshot()
         assert snapshot.temperature is None

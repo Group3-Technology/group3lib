@@ -95,7 +95,8 @@ class ScriptCommandResult:
     Attributes:
         command: The exact command text sent on the wire, without terminator.
         reply: The normalised reply string for request/reply commands, or ``None``
-            for silent-success setters and write-only commands.
+            for setters (which carry no payload on success — see
+            :meth:`Group3Protocol.send_setter`) and write-only commands.
     """
 
     command: str

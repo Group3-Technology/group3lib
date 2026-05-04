@@ -123,15 +123,34 @@ def parse_float(reply: str) -> float:
 
 
 def parse_int(reply: str) -> int:
-    """Parse an integer reply (used by commands like ``IR``, ``ID``)."""
-    stripped = reply.strip()
-    try:
-        return int(stripped)
-    except ValueError as exc:
+    """Parse an integer-valued reply (e.g. ``IR``, ``IK``, ``IJ``).
+
+    Accepts both the plain-integer form (``' 3'`` from ``IR``, a status
+    index) and the decimal-point form (``' 0.'`` from ``IK``, ``' 15.0000'``
+    from ``IJ``). Manual §4.5.2 documents that all *numeric* replies include
+    a decimal point — status-index replies like ``IR`` are the exception.
+    Rejects non-integer values (``' 1.5'`` raises).
+
+    Args:
+        reply: The normalised (terminator-stripped) reply string.
+
+    Raises:
+        ProtocolError: ``reply`` is not numeric or has a non-zero
+            fractional part.
+    """
+    match = _NUMBER_RE.match(reply)
+    if match is None:
         raise ProtocolError(
             f"Expected integer reply, got {reply!r}",
             raw=reply.encode("ascii", errors="replace"),
-        ) from exc
+        )
+    value = float(match.group("value"))
+    if value != int(value):
+        raise ProtocolError(
+            f"Expected integer-valued reply, got {reply!r}",
+            raw=reply.encode("ascii", errors="replace"),
+        )
+    return int(value)
 
 
 def parse_bool_flag(reply: str) -> bool:

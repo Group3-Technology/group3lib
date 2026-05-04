@@ -82,6 +82,9 @@ def main() -> int:
     parser.add_argument("port", help="Serial port, e.g. /dev/cu.usbserial-1 or COM3")
     parser.add_argument("output", help="Path to TSV file to create")
     parser.add_argument("--baud", type=int, default=9600, help="Baud rate (default 9600)")
+    parser.add_argument("--bytesize", type=int, default=7, choices=[7, 8])
+    parser.add_argument("--parity", default="E", choices=["N", "E", "O"])
+    parser.add_argument("--stopbits", type=float, default=2, choices=[1, 1.5, 2])
     parser.add_argument("--timeout", type=float, default=2.0, help="Read timeout in seconds")
     parser.add_argument(
         "--interval-seconds",
@@ -100,7 +103,14 @@ def main() -> int:
     output_path = Path(args.output)
     with output_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle, delimiter="\t")
-        with SerialTransport(args.port, baudrate=args.baud, timeout=args.timeout) as transport:
+        with SerialTransport(
+            args.port,
+            baudrate=args.baud,
+            bytesize=args.bytesize,
+            parity=args.parity,
+            stopbits=args.stopbits,
+            timeout=args.timeout,
+        ) as transport:
             dtm = DTM151Serial(Group3Protocol(transport))
             try:
                 _write_field(writer, dtm, args.interval_seconds, args.meta_every)

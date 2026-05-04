@@ -28,8 +28,9 @@ Usage::
     python examples/walkthrough.py /dev/cu.usbserial-1            # dry run
     python examples/walkthrough.py /dev/cu.usbserial-1 --execute  # for real
 
-The instrument is assumed to be configured for 9600-8-N-1 with CR terminator
-(factory default; manual §3.6). Override baud via ``--baud``.
+The instrument is assumed to be configured for 9600 7E2 with CR terminator
+(factory default; manual §3.6). Override via ``--baud``, ``--bytesize``,
+``--parity``, ``--stopbits``.
 """
 
 from __future__ import annotations
@@ -149,6 +150,9 @@ def main() -> int:
     )
     parser.add_argument("port", help="Serial port, e.g. /dev/cu.usbserial-1 or COM3")
     parser.add_argument("--baud", type=int, default=9600, help="Baud rate (default 9600)")
+    parser.add_argument("--bytesize", type=int, default=7, choices=[7, 8])
+    parser.add_argument("--parity", default="E", choices=["N", "E", "O"])
+    parser.add_argument("--stopbits", type=float, default=2, choices=[1, 1.5, 2])
     parser.add_argument(
         "--timeout",
         type=float,
@@ -163,7 +167,14 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    with SerialTransport(args.port, baudrate=args.baud, timeout=args.timeout) as transport:
+    with SerialTransport(
+        args.port,
+        baudrate=args.baud,
+        bytesize=args.bytesize,
+        parity=args.parity,
+        stopbits=args.stopbits,
+        timeout=args.timeout,
+    ) as transport:
         dtm = DTM151Serial(Group3Protocol(transport))
         if args.execute:
             execute_walkthrough(dtm)

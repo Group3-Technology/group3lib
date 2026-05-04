@@ -112,8 +112,9 @@ class FakeTransport:
         """Pop and return the next queued reply, or ``b""`` if the queue is empty.
 
         In tests, a queued reply represents "what the device happens to send
-        back". For a setter with silent-success, do not queue a reply — the
-        drain returns ``b""`` and the protocol layer treats that as success.
+        back". For a setter, real hardware acks with a bare terminator (e.g.
+        ``b'\\n'``) — queue that to mirror reality. ``b""`` (no queued reply)
+        also passes, since the protocol layer treats both as success.
         """
         del timeout  # FakeTransport does not model wall-clock timeouts here.
         if not self._is_open:

@@ -48,9 +48,12 @@ class AddressedProtocol:
     def send(self, command: str, timeout: float | None = None) -> str:
         """Address the device, then send ``command`` and return the reply.
 
-        Per manual §4.5.2, ``An`` is silent — the device emits no reply. We send
-        it via ``write_only`` and then send the real command which does return a
-        reply.
+        Per manual §4.5.2, ``An`` is described as silent. We send it via
+        ``write_only`` and then send the real command which does return a
+        reply. (Note: every probed setter on the bench DTM-151-S actually acks
+        with a bare ``\\n`` despite the manual's "silent" wording, so ``An``
+        may behave the same — this code path has not yet been verified
+        against real multi-drop hardware.)
         """
         self._inner.send_no_reply(commands.a_set_address(self._address))
         return self._inner.send(command, timeout=timeout)

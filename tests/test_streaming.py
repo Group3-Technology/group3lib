@@ -98,7 +98,8 @@ class TestSendModeAndSamplingInterval:
             dtm.set_sampling_interval(65535)
 
     def test_get_sampling_interval(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
-        fake.queue_reply(b" 1\r")
+        # Real device returns IK in decimal form (' 1.' for K=1).
+        fake.queue_reply(b" 1.\r")
         assert dtm.get_sampling_interval() == 1
         assert fake.sent == [SENT_IK]
 
@@ -142,7 +143,7 @@ class TestStreamField:
         # 4. ...iterate...
         # 5. SM0 on exit.
         # 6. K0 to restore original Kn.
-        fake.queue_reply(b" 0\r")  # reply to IK
+        fake.queue_reply(b" 0.\r")  # reply to IK
         with dtm.stream_field(interval_seconds=1):
             pass
         assert fake.sent == [SENT_IK, SENT_K1, SENT_SM1, SENT_SM0, SENT_K0]
@@ -151,7 +152,7 @@ class TestStreamField:
         self, dtm: DTM151Serial, fake: FakeTransport
     ) -> None:
         """interval_seconds=0 sets K0 = internal max rate (10 Hz)."""
-        fake.queue_reply(b" 1\r")  # reply to IK (original was K1)
+        fake.queue_reply(b" 1.\r")  # reply to IK (original was K1)
         with dtm.stream_field(interval_seconds=0):
             pass
         assert fake.sent == [SENT_IK, SENT_K0, SENT_SM1, SENT_SM0, SENT_K1]

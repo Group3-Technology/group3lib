@@ -6,9 +6,10 @@ fresh install. If ``pyserial`` is missing and :class:`SerialTransport` is constr
 we raise a clear ``ImportError`` pointing the user at the extras group.
 
 The DTM-151-S accepts configurable serial parameters set by internal DIP switches
-(manual section 3.6). Defaults of **9600 baud, 8N1, no flow control** match the
-factory default shipped by Group3 Technology, but callers should confirm against the
-physical switch positions on their unit.
+(manual section 3.6). ``SerialTransport`` defaults to **9600 baud, 7E2,
+no flow control** — the factory default shipped by Group3 Technology
+(verified against an Antala bench unit). Override ``bytesize``, ``parity``,
+``stopbits`` for non-default DIP-switch settings.
 
 Reply-terminator handling follows manual §3.6: the final terminator is either CR
 (S2-2 ON) or LF (S2-2 OFF), optionally preceded by the other character as a
@@ -40,8 +41,9 @@ class SerialTransport:
     Args:
         port: Serial port identifier (e.g., ``/dev/cu.usbserial-1``, ``COM3``).
         baudrate: Baud rate. Must match the bit-rate switch (manual §3.7).
-        bytesize, parity, stopbits: Framing parameters. Defaults match the
-            DTM-151-S factory default of 8N1.
+        bytesize, parity, stopbits: Framing parameters. Default to 7E2 to
+            match the DTM-151-S factory shipping configuration. Override for
+            units with non-default S2 DIP-switch settings.
         timeout: Per-read timeout in seconds. Applied to :meth:`request` unless
             overridden on the call.
         rtscts, xonxoff: Flow-control toggles. DTM-151-S does not use flow
@@ -58,9 +60,9 @@ class SerialTransport:
         self,
         port: str,
         baudrate: int = 9600,
-        bytesize: int = 8,
-        parity: str = "N",
-        stopbits: float = 1,
+        bytesize: int = 7,
+        parity: str = "E",
+        stopbits: float = 2,
         timeout: float = 1.0,
         rtscts: bool = False,
         xonxoff: bool = False,
@@ -90,6 +92,11 @@ class SerialTransport:
             raise ValueError("pair_peek_timeout must be >= 0")
         self._pair_peek_timeout = pair_peek_timeout
         self._ser: Any = None
+        # One-byte pushback buffer used by _drain_*_terminators when they
+        # accidentally consume a non-terminator byte while draining residue.
+        # Pyserial has no native pushback; we re-serve from _pushback before
+        # touching the OS buffer.
+        self._pushback: bytes = b""
 
     # ------------------------------------------------------------------
     # open / close
@@ -129,6 +136,7 @@ class SerialTransport:
             raise TransportError(f"Error closing serial port: {exc}") from exc
         finally:
             self._ser = None
+            self._pushback = b""
 
     # ------------------------------------------------------------------
     # read / write
@@ -147,6 +155,9 @@ class SerialTransport:
             ser.timeout = effective_timeout
             try:
                 ser.reset_input_buffer()
+                # reset_input_buffer wipes the OS buffer; any residue we'd
+                # stashed for push-back is now stale and must be dropped too.
+                self._pushback = b""
                 ser.write(payload)
                 ser.flush()
             except Exception as exc:
@@ -156,14 +167,14 @@ class SerialTransport:
             deadline = time.monotonic() + effective_timeout
             term_bytes = self._terminator_bytes
             while time.monotonic() < deadline:
-                chunk = ser.read(1)
+                chunk = self._read_byte(ser)
                 if not chunk:
                     # read returned empty because of the per-byte timeout; loop
                     # to the deadline so callers get a consistent TimeoutError.
                     continue
                 buf.extend(chunk)
                 if chunk[0] in term_bytes:
-                    self._consume_paired_terminator(ser, buf, chunk[0])
+                    self._drain_trailing_terminators(ser, buf)
                     return bytes(buf)
             if buf:
                 raise Group3TimeoutError(
@@ -176,39 +187,79 @@ class SerialTransport:
         finally:
             ser.timeout = original_timeout
 
-    def _consume_paired_terminator(
-        self, ser: _serial_types.Serial, buf: bytearray, first: int
-    ) -> None:
-        """After seeing a terminator byte, peek for a possible paired partner.
+    def _read_byte(self, ser: _serial_types.Serial) -> bytes:
+        """Read one byte, draining ``_pushback`` first.
 
-        Manual §3.6 allows CR+LF (S2-3 ON with S2-2 OFF) and LF+CR (S2-3 ON with
-        S2-2 ON). We've just read either CR or LF; peek briefly for the other.
-        If a matching paired byte arrives, consume it into ``buf``. Anything
-        else remains in the OS buffer — ``reset_input_buffer`` on the next
-        request will clear it, so we do not drop data silently here.
+        Pyserial has no push-back primitive, so the drain helpers stash any
+        accidentally-consumed non-terminator byte in ``self._pushback`` and
+        re-serve it here before touching the OS buffer.
+        """
+        if self._pushback:
+            byte, self._pushback = self._pushback[:1], self._pushback[1:]
+            return byte
+        result: bytes = ser.read(1)
+        return result
+
+    def _drain_trailing_terminators(
+        self, ser: _serial_types.Serial, buf: bytearray
+    ) -> None:
+        """After the first terminator byte, drain ALL consecutive terminator bytes.
+
+        Manual §3.6 documents 1- or 2-byte terminator combinations (CR, LF,
+        CR+LF, LF+CR), but real DTM-151-S firmware on some DIP-switch
+        configurations emits 3 bytes (e.g. ``\\n\\r\\n``) for request-reply
+        responses while sending only ``\\n`` for setter acks and ``\\n\\r``
+        for streaming readings. Rather than encode each combination, drain
+        all consecutive CR/LF bytes within the peek window. A non-terminator
+        byte stops the drain and is push-back'd for the next read.
         """
         if self._pair_peek_timeout <= 0:
             return
         saved = ser.timeout
         ser.timeout = self._pair_peek_timeout
         try:
-            peek = ser.read(1)
-        except Exception:  # pragma: no cover - defensive
-            return
+            while True:
+                peek = self._read_byte(ser)
+                if not peek:
+                    return
+                if peek[0] in self._terminator_bytes:
+                    buf.extend(peek)
+                    continue
+                # Non-terminator byte — out of the terminator zone. Restore
+                # via pushback so the next read sees it.
+                self._pushback = peek + self._pushback
+                return
         finally:
             ser.timeout = saved
-        if not peek:
+
+    def _drain_leading_terminators(self, ser: _serial_types.Serial) -> None:
+        """Discard any leading terminator bytes from pushback + OS buffer.
+
+        Cleans up residue left behind by a prior request whose terminator
+        was longer than this transport happened to consume. Only drains
+        bytes that are *already* buffered (no blocking) — does not wait for
+        bytes that might or might not arrive.
+        """
+        # Drop terminator bytes from the front of the pushback buffer.
+        while self._pushback and self._pushback[0] in self._terminator_bytes:
+            self._pushback = self._pushback[1:]
+        if self._pushback:
+            return  # First pushback byte is data — leave it for the read.
+        # Drain only what's already in the OS buffer. ser.in_waiting tells
+        # us how many bytes are buffered without blocking.
+        try:
+            available = int(ser.in_waiting)
+        except Exception:  # pragma: no cover - defensive
             return
-        # Only append if it's the complementary terminator byte — CR after LF,
-        # or LF after CR. A repeated same-byte (e.g., CR then CR) or a stray
-        # non-terminator byte is NOT part of this reply; leave the OS buffer
-        # alone so the next reset_input_buffer can clean it up.
-        complement_map = {b"\r"[0]: b"\n"[0], b"\n"[0]: b"\r"[0]}
-        if peek[0] == complement_map[first]:
-            buf.extend(peek)
-        # If peek was an unexpected byte, we can't un-read it from pyserial;
-        # accept a small consistency risk (handled by reset_input_buffer on
-        # the next request) rather than mis-classifying data.
+        while available > 0:
+            byte = ser.read(1)
+            available -= 1
+            if not byte:
+                return
+            if byte[0] not in self._terminator_bytes:
+                # Restore non-terminator for the read to consume.
+                self._pushback = byte
+                return
 
     def write_only(self, payload: bytes) -> None:
         ser = self._require_open()
@@ -227,19 +278,24 @@ class SerialTransport:
         immediately. If bytes have started arriving but no terminator is
         seen within the window, we also raise — returning a partial reply
         to a streaming consumer would desync the stream.
+
+        Drains any leading terminator residue from the buffer first, so a
+        prior request whose terminator sequence was longer than expected
+        does not corrupt this read.
         """
         if timeout < 0:
             raise ValueError("timeout must be >= 0")
         ser = self._require_open()
         original_timeout = ser.timeout
         try:
+            self._drain_leading_terminators(ser)
             ser.timeout = timeout
             buf = bytearray()
             deadline = time.monotonic() + timeout
             term_bytes = self._terminator_bytes
             while time.monotonic() < deadline:
                 try:
-                    chunk = ser.read(1)
+                    chunk = self._read_byte(ser)
                 except Exception as exc:
                     raise TransportError(
                         f"Failed to read from serial port: {exc}"
@@ -248,7 +304,7 @@ class SerialTransport:
                     continue
                 buf.extend(chunk)
                 if chunk[0] in term_bytes:
-                    self._consume_paired_terminator(ser, buf, chunk[0])
+                    self._drain_trailing_terminators(ser, buf)
                     return bytes(buf)
             if buf:
                 raise Group3TimeoutError(
@@ -269,15 +325,20 @@ class SerialTransport:
         usual terminator-detection logic using the transport's default timeout
         (so partial replies don't get truncated just because the error window
         was short).
+
+        Drains any leading terminator residue from the buffer first, so a
+        prior reply whose terminator was longer than expected does not get
+        served back here as an empty frame.
         """
         if timeout < 0:
             raise ValueError("timeout must be >= 0")
         ser = self._require_open()
         original_timeout = ser.timeout
         try:
+            self._drain_leading_terminators(ser)
             ser.timeout = timeout
             try:
-                first = ser.read(1)
+                first = self._read_byte(ser)
             except Exception as exc:
                 raise TransportError(f"Failed to read from serial port: {exc}") from exc
             if not first:
@@ -287,13 +348,13 @@ class SerialTransport:
             ser.timeout = self._timeout
             buf = bytearray(first)
             if first[0] in self._terminator_bytes:
-                self._consume_paired_terminator(ser, buf, first[0])
+                self._drain_trailing_terminators(ser, buf)
                 return bytes(buf)
             deadline = time.monotonic() + self._timeout
             term_bytes = self._terminator_bytes
             while time.monotonic() < deadline:
                 try:
-                    chunk = ser.read(1)
+                    chunk = self._read_byte(ser)
                 except Exception as exc:
                     raise TransportError(
                         f"Failed to read from serial port: {exc}"
@@ -302,7 +363,7 @@ class SerialTransport:
                     continue
                 buf.extend(chunk)
                 if chunk[0] in term_bytes:
-                    self._consume_paired_terminator(ser, buf, chunk[0])
+                    self._drain_trailing_terminators(ser, buf)
                     return bytes(buf)
             # Partial reply but no terminator — return what we have. The
             # protocol layer will likely raise ProtocolError.
