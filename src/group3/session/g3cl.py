@@ -48,31 +48,43 @@ class AddressedProtocol:
     def send(self, command: str, timeout: float | None = None) -> str:
         """Address the device, then send ``command`` and return the reply.
 
-        Per manual §4.5.2, ``An`` is described as silent. We send it via
-        ``write_only`` and then send the real command which does return a
-        reply. (Note: every probed setter on the bench DTM-151-S actually acks
-        with a bare ``\\n`` despite the manual's "silent" wording, so ``An``
-        may behave the same — this code path has not yet been verified
-        against real multi-drop hardware.)
+        Per manual §4.5.2 ``An`` is described as silent, but every probed
+        setter on the bench DTM-151-S acks with a bare ``\\n``, and ``An``
+        is in the same syntactic class. We therefore drain a possible
+        bare-terminator ack synchronously after writing ``An`` so it does
+        not get read as the leading byte of ``command``'s reply. A non-empty
+        non-error reply during the drain raises :class:`ProtocolError`; a
+        §4.5.3 error string raises the matching :class:`DeviceError` (the
+        addressed device rejected the prefix).
         """
         self._inner.send_no_reply(commands.a_set_address(self._address))
+        self._inner.drain_setter_ack()
         return self._inner.send(command, timeout=timeout)
 
     def send_setter(self, command: str, error_window: float | None = None) -> None:
         """Address the device, then send a silent-success setter.
 
-        Forwards to :meth:`Group3Protocol.send_setter`, which drains the line
-        for deferred error replies (manual §4.5.3).
+        Drains the ``An`` prefix ack synchronously before issuing the setter,
+        so that the An ack is not mistaken by ``send_setter`` for the
+        setter's own ack (which would mask a deferred error from the real
+        setter — manual §4.5.3).
         """
         self._inner.send_no_reply(commands.a_set_address(self._address))
+        self._inner.drain_setter_ack()
         if error_window is None:
             self._inner.send_setter(command)
         else:
             self._inner.send_setter(command, error_window=error_window)
 
     def send_no_reply(self, command: str) -> None:
-        """Address the device, then send ``command`` without reading a reply."""
+        """Address the device, then send ``command`` without reading a reply.
+
+        Drains the ``An`` prefix ack synchronously so it does not pollute
+        the next read. The ``command`` itself is genuinely write-only
+        (e.g. a broadcast trigger), so no further drain is performed.
+        """
         self._inner.send_no_reply(commands.a_set_address(self._address))
+        self._inner.drain_setter_ack()
         self._inner.send_no_reply(command)
 
     # Deliberately no ``read_next`` / ``drain_pending`` here.
