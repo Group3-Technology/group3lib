@@ -230,10 +230,13 @@ class TestFilter:
         assert fake.sent == [SENT_D0]
 
     def test_set_send_units_on(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
+        # Hardware empirically replies with a bare LF on SU1/SU0; treated as silent ack.
+        fake.queue_reply(b"\n")
         dtm.set_send_units(True)
         assert fake.sent == [SENT_SU1]
 
     def test_set_send_units_off(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
+        fake.queue_reply(b"\n")
         dtm.set_send_units(False)
         assert fake.sent == [SENT_SU0]
 

@@ -136,6 +136,19 @@ class TestSendSetter:
         with pytest.raises(ProtocolError, match="Unexpected reply"):
             p.send_setter("Z")
 
+    @pytest.mark.parametrize("terminator", [b"\r", b"\n", b"\r\n", b"\n\r"])
+    def test_bare_terminator_treated_as_success(self, terminator: bytes) -> None:
+        # Hardware (e.g. SU1) may ack a setter with just a terminator.
+        # check_error has nothing to chew on, and the protocol layer must
+        # accept this rather than raising ProtocolError.
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_reply(terminator)
+        p = Group3Protocol(fake)
+        p.send_setter("Z")
+        assert fake.sent == [SENT_Z]
+        assert p.last_raw_rx == terminator
+
     def test_error_window_zero_skips_drain(self) -> None:
         fake = FakeTransport()
         fake.open()

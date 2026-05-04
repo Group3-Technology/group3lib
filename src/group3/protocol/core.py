@@ -212,12 +212,18 @@ class Group3Protocol:
         raw = self.transport.read_optional(error_window) if error_window > 0 else b""
 
         if raw:
-            # The device sent something — either a §4.5.3 error string or an
-            # unexpected reply. Either way the transmission for this setter is
-            # complete; clear pending_tx and record it.
+            # The device sent something — either a bare terminator ack
+            # (empirically observed on SU1 and likely other setters), a
+            # §4.5.3 error string, or an unexpected reply. Either way the
+            # transmission for this setter is complete; clear pending_tx
+            # and record it.
             self._pending_tx.clear()
             self._last = _LastExchange(tx=full_tx, rx=raw)
             reply = codec.strip_terminators(codec.decode(raw))
+            if reply == "":
+                # Terminator-only frame carries no payload — manual §4.5.2
+                # treats setters as silent on success, so accept this as success.
+                return
             check_error(reply)
             # check_error didn't raise — this was an unrecognised reply to a
             # silent-success command, which means we're desynchronised.
