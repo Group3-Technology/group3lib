@@ -15,13 +15,15 @@ from group3.exceptions import (
 )
 from group3.protocol.parser import (
     check_error,
+    parse_baud_code,
     parse_bool_flag,
+    parse_dip_switches,
     parse_float,
     parse_int,
     parse_reading,
     parse_status,
 )
-from group3.types import AcquisitionMode, MeasurementMode, Unit
+from group3.types import AcquisitionMode, BaudCode, MeasurementMode, Unit
 
 
 class TestParseFloat:
@@ -179,3 +181,120 @@ class TestCheckError:
 
     def test_empty_reply_not_errored(self) -> None:
         check_error("")  # must not raise — protocol layer handles empties
+
+
+class TestParseDipSwitches:
+    """Coverage for the Ctrl-D 16-bit DIP-switch reply parser.
+
+    Bit-ordering assumption is documented as TODO(bench) in the parser; these
+    tests pin the *current* assumption (LSB-first per bank: bit 0 = S1-1, bit
+    8 = S2-1) so any change shows up as a failing test rather than a silent
+    behavioural shift.
+    """
+
+    def test_all_off_factory_defaults(self) -> None:
+        # 7E2 (S1-6/7/8 OFF), address 0, S2 all OFF.
+        dip = parse_dip_switches(" 0000000000000000")
+        assert dip.raw_bits == 0
+        assert dip.address == 0
+        assert dip.data_format.data_bits == 7
+        assert dip.data_format.parity == "E"
+        assert dip.data_format.stop_bits == 2
+        assert dip.echo_enabled is False
+        assert dip.terminator_cr is False  # S2-2 OFF -> LF
+        assert dip.transmit_every_reading is False
+        assert dip.units_gauss is False
+
+    def test_bench_unit_reply_format_with_nibble_spaces(self) -> None:
+        # Verbatim reply from FT572EW5 on 2026-05-09: four space-separated
+        # 4-bit nibbles. Cross-checked bits: S2-2 (CR), S2-3 (double term),
+        # S2-5 (gauss), S2-7 (filter ON) — all ON; everything else OFF.
+        dip = parse_dip_switches(" 0101 0110 0000 0000 ")
+        assert dip.address == 0
+        assert dip.terminator_cr is True
+        assert dip.double_terminator is True
+        assert dip.units_gauss is True
+        assert dip.filter_enabled is True
+        assert dip.echo_enabled is False
+        assert dip.transmit_every_reading is False
+        assert dip.data_format.data_bits == 7
+        assert dip.data_format.parity == "E"
+        assert dip.data_format.stop_bits == 2
+
+    def test_address_5_via_s1_1_and_s1_3(self) -> None:
+        # Bit 0 (S1-1, +1) ON, bit 2 (S1-3, +4) ON; address = 5.
+        dip = parse_dip_switches(" 0000000000000101")
+        assert dip.address == 5
+
+    def test_address_30_max(self) -> None:
+        # All S1-1..S1-5 ON: 1+2+4+8+16 = 31. The DTM address is documented as
+        # 0..30 — values above 30 are an out-of-spec switch setting; the
+        # parser still returns the raw sum so downstream layers can decide.
+        dip = parse_dip_switches(" 0000000000011111")
+        assert dip.address == 31
+
+    def test_8n1_data_format(self) -> None:
+        # S1-8 ON, S1-7 OFF, S1-6 ON  -> 8N1 per Table 5.
+        # Bits 5/6/7 = S1-6/7/8. Set bit 5 and bit 7.
+        dip = parse_dip_switches(" 0000000010100000")
+        assert dip.data_format.data_bits == 8
+        assert dip.data_format.parity == "N"
+        assert dip.data_format.stop_bits == 1
+
+    def test_echo_bit_decoded(self) -> None:
+        # Bit 11 (S2-4) on -> echo enabled per the working assumption.
+        dip = parse_dip_switches(" 0000100000000000")
+        assert dip.echo_enabled is True
+
+    def test_terminator_cr_bit_decoded(self) -> None:
+        # Bit 9 (S2-2) on -> CR terminator (factory default).
+        dip = parse_dip_switches(" 0000001000000000")
+        assert dip.terminator_cr is True
+
+    def test_rejects_short_reply(self) -> None:
+        with pytest.raises(ProtocolError):
+            parse_dip_switches(" 010101")
+
+    def test_rejects_non_binary_chars(self) -> None:
+        with pytest.raises(ProtocolError):
+            parse_dip_switches(" 0001020304050607")  # contains 2..7
+
+    def test_rejects_empty(self) -> None:
+        with pytest.raises(ProtocolError):
+            parse_dip_switches("")
+
+
+class TestParseBaudCode:
+    """Coverage for the Ctrl-B hex-character reply parser."""
+
+    @pytest.mark.parametrize(
+        "reply, expected",
+        [
+            (" 0", BaudCode.POS_0),
+            (" 5", BaudCode.POS_5),
+            (" 9", BaudCode.POS_9),
+            (" A", BaudCode.POS_A),
+            (" E", BaudCode.POS_E),  # factory preferred 9600
+            (" F", BaudCode.POS_F),  # 19200
+        ],
+    )
+    def test_full_hex_range_accepted(self, reply: str, expected: BaudCode) -> None:
+        assert parse_baud_code(reply) is expected
+
+    def test_lowercase_hex_accepted(self) -> None:
+        assert parse_baud_code(" e") is BaudCode.POS_E
+
+    def test_no_leading_space(self) -> None:
+        assert parse_baud_code("E") is BaudCode.POS_E
+
+    def test_rejects_two_chars(self) -> None:
+        with pytest.raises(ProtocolError):
+            parse_baud_code(" EE")
+
+    def test_rejects_non_hex_char(self) -> None:
+        with pytest.raises(ProtocolError):
+            parse_baud_code(" G")
+
+    def test_rejects_empty(self) -> None:
+        with pytest.raises(ProtocolError):
+            parse_baud_code("")

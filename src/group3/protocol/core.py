@@ -31,6 +31,20 @@ class _LastExchange:
     rx: bytes = b""
 
 
+def _echo_prefix(payload: bytes, terminator: bytes) -> bytes:
+    """Return the bytes of ``payload`` the device echoes when echo is ON.
+
+    Verified on bench unit FT572EW5 (2026-05-09): the firmware echoes the
+    printable command body but suppresses the host-side CR terminator that
+    triggered command processing. Control-character commands (no terminator)
+    are echoed verbatim. So the echo prefix is the payload with its trailing
+    terminator (if any) stripped.
+    """
+    if terminator and payload.endswith(terminator):
+        return payload[: -len(terminator)]
+    return payload
+
+
 # Default window to wait after a setter for either a bare-terminator ack
 # (empirically what every probed setter sends — see examples/probe_setter_replies.py)
 # or a §4.5.3 error string. At 9600 baud the longest error string ("POSITIVE
@@ -48,6 +62,7 @@ class Group3Protocol:
         transport: Transport,
         terminator: bytes = codec.CR,
         timeout: float | None = None,
+        echo_enabled: bool = False,
     ) -> None:
         """
         Args:
@@ -56,10 +71,16 @@ class Group3Protocol:
                 requires CR on the host→device direction (manual section 4.5.2).
             timeout: Default per-request timeout in seconds. ``None`` means "use the
                 transport's default".
+            echo_enabled: ``True`` if the device is configured (via DIP S2-4 or the
+                ``SE1`` command) to echo every command byte before its reply. The
+                normal flow is to leave this ``False`` and call
+                :meth:`group3.DTM151Serial.identify` after connect, which auto-detects
+                the device's echo state and (by default) coerces it off via ``SE0``.
         """
         self.transport = transport
         self.terminator = terminator
         self.timeout = timeout
+        self.echo_enabled = echo_enabled
         self._last = _LastExchange()
         # Accumulates write_only payloads (e.g., G3CL ``An`` prefixes) so that
         # ``last_raw_tx`` after a subsequent ``send`` reflects everything that
@@ -124,7 +145,33 @@ class Group3Protocol:
             self._pending_tx.clear()
             raise
         self._pending_tx.clear()
+        accumulated_rx = bytearray(raw)
         self._last = _LastExchange(tx=full_tx, rx=raw)
+        if self.echo_enabled:
+            # With echo ON the device echoes the printable bytes of the
+            # command (without its trailing terminator — verified on bench
+            # unit FT572EW5 on 2026-05-09). The terminator is consumed by
+            # the firmware's command parser and not echoed back, though a
+            # delayed CR/LF sometimes arrives after the reply (absorbed by
+            # the terminator-drain loop below).
+            echo_prefix = _echo_prefix(payload, self.terminator)
+            if not raw.startswith(echo_prefix):
+                raise ProtocolError(
+                    f"echo expected (echo_enabled=True) but reply for "
+                    f"{command!r} does not start with the echoed payload",
+                    raw=bytes(accumulated_rx),
+                )
+            raw = raw[len(echo_prefix):]
+            if not raw or raw == self.terminator:
+                # Echo arrived alone (or with only its own terminator) —
+                # read the actual reply.
+                remaining = _remaining()
+                next_raw = self.transport.read_reply(
+                    remaining if remaining is not None else 1.0
+                )
+                accumulated_rx.extend(next_raw)
+                self._last = _LastExchange(tx=full_tx, rx=bytes(accumulated_rx))
+                raw = next_raw
         reply = codec.strip_terminators(codec.decode(raw))
         if reply == "":
             # Leading terminator residue (stale setter acks from prior
@@ -317,7 +364,33 @@ class Group3Protocol:
         self._pending_tx.extend(payload)
         full_tx = bytes(self._pending_tx)
 
-        raw = self.transport.read_optional(error_window) if error_window > 0 else b""
+        if error_window <= 0:
+            self._last = _LastExchange(tx=full_tx, rx=b"")
+            return
+
+        accumulated_rx = bytearray()
+        raw = self.transport.read_optional(error_window)
+        accumulated_rx.extend(raw)
+
+        if self.echo_enabled and raw:
+            # With echo ON the device echoes the printable command body
+            # (terminator suppressed — see _echo_prefix). Strip the echo,
+            # then read again for the actual ack/error if it didn't arrive
+            # in the same buffer.
+            echo_prefix = _echo_prefix(payload, self.terminator)
+            if not raw.startswith(echo_prefix):
+                self._pending_tx.clear()
+                self._last = _LastExchange(tx=full_tx, rx=bytes(accumulated_rx))
+                raise ProtocolError(
+                    f"echo expected for setter {command!r} but reply does "
+                    f"not start with the echoed payload",
+                    raw=bytes(accumulated_rx),
+                )
+            raw = raw[len(echo_prefix):]
+            if not raw:
+                tail = self.transport.read_optional(error_window)
+                accumulated_rx.extend(tail)
+                raw = tail
 
         if raw:
             # The device sent something — either a bare terminator ack
@@ -326,7 +399,7 @@ class Group3Protocol:
             # transmission for this setter is complete; clear pending_tx
             # and record it.
             self._pending_tx.clear()
-            self._last = _LastExchange(tx=full_tx, rx=raw)
+            self._last = _LastExchange(tx=full_tx, rx=bytes(accumulated_rx))
             reply = codec.strip_terminators(codec.decode(raw))
             if reply == "":
                 # Terminator-only frame carries no payload — manual §4.5.2
@@ -343,7 +416,92 @@ class Group3Protocol:
         # Silent success. Leave pending_tx populated so a subsequent send()
         # can include this setter's bytes in last_raw_tx, matching the debug
         # semantics of other write-only operations.
-        self._last = _LastExchange(tx=full_tx, rx=b"")
+        self._last = _LastExchange(tx=full_tx, rx=bytes(accumulated_rx))
+
+    def send_control(
+        self,
+        payload: bytes,
+        *,
+        expect_echo: bool | None = None,
+        timeout: float | None = None,
+    ) -> str:
+        """Send a single control-byte command (e.g. ``Ctrl-D``) and return the reply.
+
+        The DTM-151 v7.1 confidential commands sheet lists four control-character
+        commands (``\\x02``/``\\x04``/``\\x15``/``\\x18`` in
+        :mod:`group3.protocol.commands`) that are sent as raw bytes **without** a
+        terminator. The reply still ends with the device's configured terminator.
+
+        Args:
+            payload: The control bytes (typically a single byte). Sent verbatim.
+            expect_echo: ``True`` to require an echoed prefix, ``False`` to require
+                no echo, or ``None`` (default) to auto-detect from the reply prefix.
+                When ``None`` the protocol's :attr:`echo_enabled` flag is updated
+                from the detection result — useful as the very first probe at
+                connect time when the device's echo state is not yet known.
+            timeout: Per-call timeout. ``None`` uses :attr:`timeout`.
+
+        Returns:
+            The reply string, terminator stripped, echo prefix stripped if present.
+
+        Raises:
+            ProtocolError: ``expect_echo=True`` but the reply does not start with
+                ``payload``; or the reply is not valid ASCII.
+            DeviceError: The device returned a §4.5.3 named-error string.
+        """
+        effective_timeout = timeout if timeout is not None else self.timeout
+        deadline = (
+            time.monotonic() + effective_timeout
+            if effective_timeout is not None
+            else None
+        )
+
+        def _remaining() -> float | None:
+            if deadline is None:
+                return None
+            return max(0.0, deadline - time.monotonic())
+
+        try:
+            raw = self.transport.request(payload, timeout=_remaining())
+        except BaseException:
+            self._last = _LastExchange(tx=payload, rx=b"")
+            raise
+        accumulated_rx = bytearray(raw)
+        self._last = _LastExchange(tx=payload, rx=raw)
+
+        # Detect or enforce echoed prefix. Control-byte commands have no
+        # terminator, so the echo prefix is the full payload.
+        echo_prefix = _echo_prefix(payload, self.terminator)
+        if expect_echo is True:
+            echo_present = raw.startswith(echo_prefix)
+        elif expect_echo is False:
+            echo_present = False
+        else:
+            echo_present = raw.startswith(echo_prefix)
+            self.echo_enabled = echo_present
+
+        if expect_echo is True and not echo_present:
+            raise ProtocolError(
+                f"echo expected for control payload {payload!r} but reply "
+                f"does not start with the echoed payload",
+                raw=bytes(accumulated_rx),
+            )
+
+        if echo_present:
+            raw = raw[len(echo_prefix):]
+            if not raw:
+                # Echo arrived alone — read the actual reply.
+                remaining = _remaining()
+                next_raw = self.transport.read_reply(
+                    remaining if remaining is not None else 1.0
+                )
+                accumulated_rx.extend(next_raw)
+                self._last = _LastExchange(tx=payload, rx=bytes(accumulated_rx))
+                raw = next_raw
+
+        reply = codec.strip_terminators(codec.decode(raw))
+        check_error(reply)
+        return reply
 
     # ------------------------------------------------------------------
     # debug accessors

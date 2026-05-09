@@ -26,13 +26,21 @@ from group3.exceptions import (
 from group3.protocol import commands
 from group3.protocol.core import Group3Protocol
 from group3.protocol.parser import (
+    parse_baud_code,
     parse_bool_flag,
+    parse_dip_switches,
     parse_float,
     parse_int,
     parse_reading,
     parse_status,
 )
-from group3.types import DeviceMetadataSnapshot, DeviceStatus, Reading, ScriptCommandResult
+from group3.types import (
+    DeviceMetadataSnapshot,
+    DeviceProfile,
+    DeviceStatus,
+    Reading,
+    ScriptCommandResult,
+)
 
 
 @runtime_checkable
@@ -100,6 +108,65 @@ class DTM151Serial:
 
     def __init__(self, protocol: _ProtocolLike) -> None:
         self._protocol = protocol
+
+    # ------------------------------------------------------------------
+    # connect-time identification
+    # ------------------------------------------------------------------
+
+    def identify(self, coerce_echo_off: bool = True) -> DeviceProfile:
+        """Read the device's DIP-switch state and baud-rate switch.
+
+        Probes the device with ``Ctrl-D`` (``\\x04``) and ``Ctrl-B`` (``\\x02``)
+        to capture its boot-time configuration into a :class:`DeviceProfile`.
+        The echo state is auto-detected from the first reply and recorded on the
+        underlying :class:`Group3Protocol` so subsequent commands strip the echo
+        prefix correctly.
+
+        Recommended as the first call after :meth:`Group3Protocol` is wired to a
+        live transport — both for logging the device profile and for normalising
+        echo state across firmware DIP defaults.
+
+        Args:
+            coerce_echo_off: When ``True`` (default), if the device reports echo
+                ON the method sends ``SE0`` to disable it for the rest of the
+                session. Set ``False`` to leave echo state as the device booted.
+
+        Returns:
+            A :class:`DeviceProfile` snapshot. Note that on G3CL multi-drop
+            sessions the per-device probe is currently unsupported — call
+            :meth:`identify` only on a :class:`DTM151Serial` constructed
+            directly from a :class:`Group3Protocol`.
+
+        Raises:
+            NotImplementedError: ``self._protocol`` is not a
+                :class:`Group3Protocol` (e.g. it's an addressed G3CL protocol).
+            ProtocolError: A reply was not the expected shape — most often a
+                bit-ordering mismatch in the DIP-switch parser (see TODO note in
+                :func:`group3.protocol.parser.parse_dip_switches`).
+        """
+        protocol = self._protocol
+        if not isinstance(protocol, Group3Protocol):
+            raise NotImplementedError(
+                "identify() requires a direct Group3Protocol; G3CL multi-drop "
+                "identification is not supported in this release."
+            )
+        # Drain any S2-1 streaming noise that may have arrived before connect.
+        protocol.drain_pending()
+
+        dip_reply = protocol.send_control(commands.CTRL_D, expect_echo=None)
+        dip = parse_dip_switches(dip_reply)
+
+        # send_control already updated protocol.echo_enabled from the auto-detect.
+        baud_reply = protocol.send_control(
+            commands.CTRL_B, expect_echo=protocol.echo_enabled
+        )
+        baud = parse_baud_code(baud_reply)
+
+        if coerce_echo_off and protocol.echo_enabled:
+            protocol.send_setter(commands.SE0)
+            protocol.echo_enabled = False
+
+        return DeviceProfile(dip=dip, baud=baud, echo_enabled=protocol.echo_enabled)
 
     # ------------------------------------------------------------------
     # field measurement

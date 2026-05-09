@@ -42,9 +42,12 @@ from group3.exceptions import (
 )
 from group3.types import (
     AcquisitionMode,
+    BaudCode,
     DeviceStatus,
+    DipSwitches,
     MeasurementMode,
     Reading,
+    SerialDataFormat,
     Unit,
 )
 
@@ -223,6 +226,123 @@ def parse_status(reply: str) -> DeviceStatus:
             raw=reply.encode("ascii", errors="replace"),
         )
     return DeviceStatus(measurement=measurement, acquisition=acquisition, raw=reply)
+
+
+def parse_dip_switches(reply: str) -> DipSwitches:
+    """Parse the 16-bit binary reply from the ``Ctrl-D`` (``\\x04``) command.
+
+    The DTM-151 v7.1 confidential commands sheet documents this reply as a
+    "16-bit binary number". Every documented teslameter reply starts with a
+    space (manual section 4.5.2); this parser tolerates an optional leading
+    space and requires exactly 16 ``0``/``1`` characters.
+
+    Verified against an Antala bench unit (FT572EW5) on 2026-05-09:
+    the firmware formats the reply as ``" 0101 0110 0000 0000 \\n\\r"`` —
+    four space-separated 4-bit nibbles plus a trailing space — so this
+    parser strips **all** whitespace, not just leading/trailing. Bit
+    ordering is LSB-first per bank as assumed in the SDK design: bit 0 =
+    S1-1 (address weight 1), bit 8 = S2-1, bit 11 = S2-4 (echo). Every
+    cross-checkable bit (filter, terminator format, units, address) lined
+    up with observed device behaviour.
+
+    Args:
+        reply: The normalised (terminator-stripped) reply string.
+
+    Raises:
+        ProtocolError: ``reply`` does not contain exactly 16 binary digits
+            after whitespace is removed.
+    """
+    body = "".join(c for c in reply if not c.isspace())
+    if len(body) != 16 or any(c not in "01" for c in body):
+        raise ProtocolError(
+            f"Expected 16-bit binary DIP-switch reply, got {reply!r}",
+            raw=reply.encode("ascii", errors="replace"),
+        )
+    raw_bits = int(body, 2)
+
+    # TODO(bench): verify the bit ordering. Tentative assumption: LSB-first per
+    # bank — bit 0 = S1-1, bit 7 = S1-8, bit 8 = S2-1, bit 15 = S2-8.
+    def _bit(index: int) -> bool:
+        return bool((raw_bits >> index) & 1)
+
+    address = (
+        (1 if _bit(0) else 0)
+        + (2 if _bit(1) else 0)
+        + (4 if _bit(2) else 0)
+        + (8 if _bit(3) else 0)
+        + (16 if _bit(4) else 0)
+    )
+
+    # Table 5: S1-6/S1-7/S1-8 (bits 5/6/7) → data bits, parity, stop bits.
+    fmt_key = (_bit(7), _bit(6), _bit(5))  # (S1-8, S1-7, S1-6) per Table 5 row order
+    fmt_table: dict[tuple[bool, bool, bool], SerialDataFormat] = {
+        (False, False, False): SerialDataFormat(7, "E", 2),
+        (False, False, True): SerialDataFormat(7, "O", 2),
+        (False, True, False): SerialDataFormat(7, "E", 1),
+        (False, True, True): SerialDataFormat(7, "O", 1),
+        (True, False, False): SerialDataFormat(8, "N", 2),
+        (True, False, True): SerialDataFormat(8, "N", 1),
+        (True, True, False): SerialDataFormat(8, "E", 1),
+        (True, True, True): SerialDataFormat(8, "O", 1),
+    }
+    data_format = fmt_table[fmt_key]
+
+    return DipSwitches(
+        raw_bits=raw_bits,
+        address=address,
+        data_format=data_format,
+        transmit_every_reading=_bit(8),    # S2-1
+        terminator_cr=_bit(9),             # S2-2
+        double_terminator=_bit(10),        # S2-3
+        echo_enabled=_bit(11),             # S2-4
+        units_gauss=_bit(12),              # S2-5
+        units_symbol=_bit(13),             # S2-6
+        filter_enabled=_bit(14),           # S2-7
+        reload_defaults_on_power=_bit(15), # S2-8
+    )
+
+
+_BAUD_CODE_TABLE: Final[dict[str, BaudCode]] = {
+    "0": BaudCode.POS_0,
+    "1": BaudCode.POS_1,
+    "2": BaudCode.POS_2,
+    "3": BaudCode.POS_3,
+    "4": BaudCode.POS_4,
+    "5": BaudCode.POS_5,
+    "6": BaudCode.POS_6,
+    "7": BaudCode.POS_7,
+    "8": BaudCode.POS_8,
+    "9": BaudCode.POS_9,
+    "A": BaudCode.POS_A,
+    "B": BaudCode.POS_B,
+    "C": BaudCode.POS_C,
+    "D": BaudCode.POS_D,
+    "E": BaudCode.POS_E,
+    "F": BaudCode.POS_F,
+}
+
+
+def parse_baud_code(reply: str) -> BaudCode:
+    """Parse the single hex-character reply from the ``Ctrl-B`` (``\\x02``) command.
+
+    Manual Table 7 (page 3-12) lists 16 switch positions ``0..F`` mapping to
+    50 baud through 19200 baud. The v7.1 confidential sheet documents the
+    reply as ``"char: A…F"`` — likely a typo for ``0..F``; this parser
+    accepts the full range. Leading space (manual §4.5.2) is tolerated.
+
+    Args:
+        reply: The normalised (terminator-stripped) reply string.
+
+    Raises:
+        ProtocolError: ``reply`` is not a single hex character ``0..F``.
+    """
+    body = reply.strip().upper()
+    if len(body) != 1 or body not in _BAUD_CODE_TABLE:
+        raise ProtocolError(
+            f"Expected single hex baud-code reply, got {reply!r}",
+            raw=reply.encode("ascii", errors="replace"),
+        )
+    return _BAUD_CODE_TABLE[body]
 
 
 def _unit_from_suffix(text: str) -> Unit:

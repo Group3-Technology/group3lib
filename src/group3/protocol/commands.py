@@ -74,6 +74,24 @@ NT: Final = "NT"  # Display mode: temperature.
 SM0: Final = "SM0"  # Send mode: F-Request. Device replies only when host sends F.
 SM1: Final = "SM1"  # Send mode: Timed. Device auto-transmits every Kn seconds.
 
+# Echo control (DTM-151 Commands v7.1, Turn Echo ON/OFF row).
+SE0: Final = "SE0"  # Echo OFF — device does not echo command bytes before replies.
+SE1: Final = "SE1"  # Echo ON — device echoes every command byte first.
+
+# -----------------------------------------------------------------------------
+# Control-byte commands (DTM-151 Commands v7.1).
+#
+# Unlike the ASCII commands above, these are single non-printable bytes sent
+# WITHOUT a terminator. The device's reply still ends with the configured
+# terminator. They are dispatched via :meth:`Group3Protocol.send_control`,
+# which bypasses the codec's terminator append.
+# -----------------------------------------------------------------------------
+
+CTRL_B: Final[bytes] = b"\x02"  # Baud Rate Switch: Request — reply is one hex char.
+CTRL_D: Final[bytes] = b"\x04"  # DIP Switches: Request — reply is a 16-bit binary string.
+CTRL_U: Final[bytes] = b"\x15"  # Restart DTM — reply is the firmware banner.
+CTRL_X: Final[bytes] = b"\x18"  # Reset DTM (reload defaults) — reply is "RESET".
+
 
 # -----------------------------------------------------------------------------
 # Parametrised builders
@@ -179,6 +197,22 @@ def sm_set_send_mode(enabled: bool) -> str:
     if not isinstance(enabled, bool):
         raise CommandError(f"enabled must be bool, got {type(enabled).__name__}")
     return SM1 if enabled else SM0
+
+
+def se_set_echo(enabled: bool) -> str:
+    """Build the ``SEn`` echo-on/off command (DTM-151 Commands v7.1).
+
+    With echo ON the device echoes every command byte before transmitting the
+    reply. The protocol layer strips this prefix when
+    :attr:`group3.protocol.core.Group3Protocol.echo_enabled` is ``True``.
+
+    Args:
+        enabled: ``True`` selects ``SE1`` (echo ON), ``False`` selects ``SE0``
+            (echo OFF — the SDK's preferred state for predictable parsing).
+    """
+    if not isinstance(enabled, bool):
+        raise CommandError(f"enabled must be bool, got {type(enabled).__name__}")
+    return SE1 if enabled else SE0
 
 
 def su_set_send_units(enabled: bool) -> str:
