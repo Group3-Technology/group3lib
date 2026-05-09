@@ -29,6 +29,9 @@ For multi-drop (G3CL) usage with multiple addressable devices::
 
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
+
 from group3.exceptions import (
     BadTemperatureReadingError,
     CommandError,
@@ -73,7 +76,14 @@ from group3.types import (
     Unit,
 )
 
-__version__ = "0.2.0"
+try:
+    __version__ = _pkg_version("group3lib")
+except PackageNotFoundError:  # pragma: no cover — only hit in unusual setups
+    # Package metadata is missing — typically when the source tree is on
+    # sys.path without ever having been installed (not even editable).
+    # Surface "0.0.0+unknown" so the attribute exists; a real install
+    # always resolves the canonical version from pyproject.toml.
+    __version__ = "0.0.0+unknown"
 
 __all__ = [
     "AcquisitionMode",

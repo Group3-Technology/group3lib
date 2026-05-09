@@ -2,10 +2,10 @@
 
 A typed Python driver library for Group3 Technology digital teslameters.
 
-**v0.2 supports the DTM-151-S (serial variant), including live `SM1`
-streaming and probe-temperature reads.** The architecture is deliberately
-layered (transport / protocol / session / model) so that future models —
-DTM-152, DTM-333, HTM-121, etc. — slot in without rewriting the core.
+**Supports the DTM-151-S (serial variant), including live `SM1` streaming
+and probe-temperature reads.** The architecture is deliberately layered
+(transport / protocol / session / model) so that future models —
+DTM-351, HTM-141, etc. — slot in without rewriting the core.
 
 ## Install
 
@@ -15,28 +15,31 @@ without it.
 
 ### From a released wheel
 
-Download `group3lib-<version>-py3-none-any.whl` from the project's distribution
-channel (GitHub Release, internal index, shared drive, etc.) and install it
-directly:
+Tagged versions are published to the project's
+[GitHub Releases page](https://github.com/antala-co/group3lib/releases) by the
+[`Release`](.github/workflows/release.yml) workflow. Each release attaches a
+`group3lib-<version>-py3-none-any.whl` and a matching `.tar.gz` sdist.
+
+Replace `<VERSION>` below with the release tag (e.g. `0.X.Y`) — see the
+[Releases page](https://github.com/antala-co/group3lib/releases) for the
+latest tag.
 
 ```bash
 # Core library only (no pyserial):
-pip install group3lib-0.2.0-py3-none-any.whl
+pip install https://github.com/antala-co/group3lib/releases/download/v<VERSION>/group3lib-<VERSION>-py3-none-any.whl
 
 # With pyserial for real RS-232 / fiber-optic hardware:
-pip install "group3lib-0.2.0-py3-none-any.whl[serial]"
+pip install "group3lib[serial] @ https://github.com/antala-co/group3lib/releases/download/v<VERSION>/group3lib-<VERSION>-py3-none-any.whl"
 
-# Add live-plot support (matplotlib):
-pip install "group3lib-0.2.0-py3-none-any.whl[serial,plot]"
+# Or download the wheel locally and install it:
+pip install ./group3lib-<VERSION>-py3-none-any.whl
+pip install "./group3lib-<VERSION>-py3-none-any.whl[serial,plot]"
 ```
 
-Point `pip` at a URL or a directory instead if that's how the wheels are
-distributed:
-
-```bash
-pip install https://example.com/downloads/group3lib-0.2.0-py3-none-any.whl
-pip install --find-links ./dist "group3lib[serial]"
-```
+For a pre-release build off a feature branch, every PR's
+[`CI`](.github/workflows/ci.yml) run uploads the wheel as a `dist-<sha>`
+artifact (14-day retention) — download it from the run's *Summary* page in
+the Actions tab.
 
 ### From source
 
@@ -49,48 +52,42 @@ pip install -e ".[all]"           # editable install with pyserial + dev tools
 
 ## Building a wheel for distribution
 
-The project uses the standard PEP 517 build path via [`build`][pypa-build].
+CI handles this automatically:
 
-```bash
-pip install build               # one-off, into your dev environment
-python -m build                 # runs an isolated build
-```
-
-[pypa-build]: https://pypa-build.readthedocs.io/
-
-This produces two files under `dist/` (which is already gitignored):
-
-```
-dist/
-├── group3lib-0.2.0-py3-none-any.whl     # the wheel — what users install
-└── group3lib-0.2.0.tar.gz               # sdist — fallback when no wheel fits
-```
+- The [`CI`](.github/workflows/ci.yml) workflow runs lint (`ruff`), types
+  (`mypy --strict`), and the test matrix (Python 3.10–3.13) on every PR and
+  push to `main`, then builds the wheel and uploads it as a `dist-<sha>`
+  artifact.
+- The [`Release`](.github/workflows/release.yml) workflow runs on `v*` tag
+  pushes. It verifies that the tag matches `pyproject.toml`'s `project.version`,
+  re-runs the full quality gate, builds the wheel + sdist, and creates a
+  GitHub Release with the artifacts attached and auto-generated notes.
 
 The wheel tag `py3-none-any` means it installs on any Python 3 interpreter on
 any OS — there is no native code to compile.
 
-**Release checklist:**
+**Release flow:**
 
 1. Bump the `version` field in [`pyproject.toml`](pyproject.toml); wheels with
    the same version cannot be re-published.
-2. Run `pytest -q && ruff check src tests && mypy --strict src tests` — all
-   must be green before building.
-3. Remove previous artefacts with `rm -rf dist/ build/` so stale versions
-   don't get uploaded by mistake.
-4. Build: `python -m build`.
-5. Smoke-test the wheel in a clean venv:
+2. Merge to `main` (CI must be green).
+3. Tag and push:
    ```bash
-   python -m venv /tmp/g3-verify
-   /tmp/g3-verify/bin/pip install "dist/group3lib-<version>-py3-none-any.whl[serial]"
-   /tmp/g3-verify/bin/python -c "import group3; print(group3.__version__)"
-   rm -rf /tmp/g3-verify
+   git tag v0.3.0
+   git push origin v0.3.0
    ```
-6. Publish the wheel (and optionally the sdist) to your distribution channel:
-   - **GitHub Release:** attach `dist/*` to the tag.
-   - **Private index** (`devpi`, `pypiserver`, AWS CodeArtifact, etc.): push
-     via `twine upload --repository <name> dist/*`.
-   - **Public PyPI:** `pip install twine && twine upload dist/*` (requires an
-     unclaimed package name and a PyPI API token).
+4. The Release workflow builds and attaches the artifacts to a new GitHub
+   Release. If the tag and `pyproject.toml` version disagree, the workflow
+   fails fast — bump the version and re-tag.
+
+**Building locally** (rarely needed; useful for smoke-testing before tagging):
+
+```bash
+pip install build
+python -m build                 # produces dist/*.whl and dist/*.tar.gz
+```
+
+[pypa-build]: https://pypa-build.readthedocs.io/
 
 ## Quickstart
 
@@ -210,7 +207,7 @@ unattended lab runs.
 
 | Model | Variant | Status |
 | --- | --- | --- |
-| DTM-151 | S (serial) | ✅ v0.2 — field, peak, temperature, streaming, G3CL |
+| DTM-151 | S (serial) | ✅ field, peak, temperature, streaming, G3CL |
 | DTM-151 | G (IEEE-488) | ❌ out of scope |
 | DTM-152 | S | 🛣️ roadmap |
 | DTM-333 | S | 🛣️ roadmap |
@@ -219,15 +216,13 @@ To extend to a new model, see [`docs/extending.md`](docs/extending.md).
 
 ## Supported commands
 
-Cross-reference:
-`manuals/DTM-151-S Manual_v7.1.pdf` (Table 9) and
-`manuals/DTM-151 v7.1 Commands -Confidential.pdf`.
+Cross-reference: `manuals/DTM-151-S Manual_v7.1.pdf` (Table 9, §4.5–4.7).
 
 | Command | Python API | Notes |
 | --- | --- | --- |
 | `F` | `dtm.read_field()` | Field reading |
 | `P` | `dtm.read_peak()` | Peak-hold field |
-| `Q` | `dtm.front_panel_test()` | Front-panel display self-test (v7.1) |
+| `Q` | `dtm.front_panel_test()` | Front-panel display self-test |
 | `EP` | `dtm.erase_peak()` | Reset peak-hold value |
 | `T` | `dtm.read_temperature()` | Probe temperature (temp-corrected probes) |
 | `Z` / `EZ` | `dtm.zero()` / `dtm.erase_zero()` | Current-range zero |
@@ -247,7 +242,7 @@ Cross-reference:
 | `Kn` / `IK` | `dtm.set_sampling_interval()` / `dtm.get_sampling_interval()` | Streaming rate |
 | `SUn` | `dtm.set_send_units()` | Include units in numeric replies |
 | `SEn` | `dtm.set_echo()` | Command-byte echo on/off |
-| `UFG` / `UFT` | `dtm.set_display_units("G"/"T")` | Front-panel display units (v7.1 sheet writes this as `Ufc`) |
+| `UFG` / `UFT` | `dtm.set_display_units("G"/"T")` | Front-panel display units |
 | `B<text>` | `dtm.display_text(text)` | Show up to 7 chars on front panel |
 | `Ln` | `dtm.set_field_scale_for(value)` | Scale: make current reading equal *value* |
 | `SLn` | `dtm.set_global_scale(value)` | Set global scale factor directly |
@@ -267,11 +262,6 @@ Higher-level helpers built on those commands:
 | `dtm.read_metadata_snapshot()` | Temperature + range + filter + `Kn` + `IG` in one call set |
 | `dtm.run_script(text)` | Execute LabVIEW-style concatenated command scripts such as `SU1IRID` |
 
-Commands from the confidentials reference that are **not yet exposed**:
-`ISF` (firmware version), `ISS` (serial number), and the cal-menu /
-manufacturer-only command set (calibration submenu, EEPROM access). The
-v7.1 confidential sheet flags these as not customer-accessible.
-
 ## Testing
 
 Tests cover both the in-memory `FakeTransport` (protocol/model/session) and the
@@ -281,8 +271,11 @@ real serial port is required:
 ```bash
 pytest -q
 ruff check src tests
-mypy --strict src tests
+mypy --strict src
 ```
+
+The same three commands run in [`CI`](.github/workflows/ci.yml) on every PR
+and push to `main`, across Python 3.10, 3.11, 3.12, and 3.13.
 
 Every public method on `DTM151Serial` has a **golden-transcript test** that pins
 the exact bytes sent on the wire against Table 9 of the manual. If you change a
