@@ -231,8 +231,14 @@ class DTM151Serial:
             temperature=temperature,
         )
 
-    def reset_peak(self) -> None:
-        """Reset the peak-hold value to zero (``Q`` command)."""
+    def front_panel_test(self) -> None:
+        """Run the device's front-panel display self-test (``Q`` command).
+
+        Per the DTM-151 v7.1 confidential commands sheet, ``Q`` in base
+        mode triggers a brief visual test of the LED display. The device
+        emits no parsable reply. To reset the peak-hold value use
+        :meth:`erase_peak` (the ``EP`` command).
+        """
         self._protocol.send_setter(commands.Q)
 
     # ------------------------------------------------------------------

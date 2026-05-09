@@ -227,7 +227,8 @@ Cross-reference:
 | --- | --- | --- |
 | `F` | `dtm.read_field()` | Field reading |
 | `P` | `dtm.read_peak()` | Peak-hold field |
-| `Q` | `dtm.reset_peak()` | Reset peak-hold |
+| `Q` | `dtm.front_panel_test()` | Front-panel display self-test (v7.1) |
+| `EP` | `dtm.erase_peak()` | Reset peak-hold value |
 | `T` | `dtm.read_temperature()` | Probe temperature (temp-corrected probes) |
 | `Z` / `EZ` | `dtm.zero()` / `dtm.erase_zero()` | Current-range zero |
 | `Rn` / `IR` | `dtm.set_range(n)` / `dtm.get_range()` | 0.3 / 0.6 / 1.2 / 3.0 T |

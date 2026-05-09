@@ -89,9 +89,19 @@ class TestReadings:
         assert fake.sent == [SENT_P]
         assert r.value == pytest.approx(2.9999)
 
-    def test_reset_peak_sends_Q(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
-        dtm.reset_peak()
+    def test_front_panel_test_sends_Q(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        # ``Q`` is the front-panel visual self-test per v7.1 confidential
+        # sheet — peak-hold reset is ``EP`` (see test_erase_peak below).
+        dtm.front_panel_test()
         assert fake.sent == [SENT_Q]
+
+    def test_erase_peak_sends_EP(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        dtm.erase_peak()
+        assert fake.sent == [SENT_EP]
 
     def test_read_temperature_sends_T_and_parses_reply(
         self, dtm: DTM151Serial, fake: FakeTransport

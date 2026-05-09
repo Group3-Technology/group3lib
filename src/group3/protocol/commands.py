@@ -26,7 +26,9 @@ from group3.exceptions import CommandError
 
 F: Final = "F"  # Field reading — current selected range.
 P: Final = "P"  # Peak hold field reading.
-Q: Final = "Q"  # Reset peak hold.
+Q: Final = "Q"  # Test DTM front-panel display (visual self-test). Per v7.1
+                # confidential commands sheet — base mode only. Peak-hold
+                # reset is ``EP``, exposed as :meth:`DTM151Serial.erase_peak`.
 T: Final = "T"  # Temperature reading from the probe's temperature sensor.
 
 Z: Final = "Z"  # Zero the currently selected range.
