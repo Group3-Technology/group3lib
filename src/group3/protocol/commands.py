@@ -80,6 +80,12 @@ SM1: Final = "SM1"  # Send mode: Timed. Device auto-transmits every Kn seconds.
 SE0: Final = "SE0"  # Echo OFF — device does not echo command bytes before replies.
 SE1: Final = "SE1"  # Echo ON — device echoes every command byte first.
 
+# Raw-field diagnostic readouts (DTM-151 Commands v7.1).
+# Reply is FP per the confidential sheet — same shape as F/P.
+WA: Final = "WA"  # Raw field reading post-ADC (no zero/cal/scale applied).
+WE: Final = "WE"  # Raw field reading post-cal (zero NOT applied).
+WZ: Final = "WZ"  # Raw field reading post-zero (cal NOT applied).
+
 # -----------------------------------------------------------------------------
 # Control-byte commands (DTM-151 Commands v7.1).
 #
@@ -269,6 +275,154 @@ def sc_set_calibration(factor: float) -> str:
     if fvalue <= 0:
         raise CommandError(f"calibration factor must be positive, got {factor}")
     return f"SC{_format_number(fvalue)}"
+
+
+def b_display_text(text: str) -> str:
+    """Build the ``B<text>`` display-text command (DTM-151 Commands v7.1).
+
+    Writes up to 7 ASCII characters to the front-panel display. The
+    confidential commands sheet notes that a terminator is required if
+    fewer than 7 chars are sent — the codec always appends one, so this
+    works either way.
+
+    Args:
+        text: ASCII text to display, 1..7 characters. Empty strings are
+            rejected because the device's behaviour is undefined.
+
+    Raises:
+        CommandError: ``text`` is non-ASCII, empty, or longer than 7 chars.
+    """
+    if not isinstance(text, str):
+        raise CommandError(f"display text must be str, got {type(text).__name__}")
+    if not text:
+        raise CommandError("display text must not be empty")
+    if len(text) > 7:
+        raise CommandError(f"display text max length is 7, got {len(text)}")
+    try:
+        text.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise CommandError(
+            f"display text must be ASCII; non-ASCII at index {exc.start}: {text!r}"
+        ) from exc
+    return f"B{text}"
+
+
+def c_calibrate(value: float) -> str:
+    """Build the ``Cn`` live-calibration command (DTM-151 Commands v7.1).
+
+    Customer-accessible base-mode calibration entry. Distinct from the
+    cal-menu ``C`` (no-arg) and from ``SCn`` (calibration-factor write).
+
+    .. warning::
+       TODO(manual): the precise semantic effect of ``Cn`` in base mode is
+       not fully documented in the v7.1 sheet — the safest assumption is
+       that ``n`` is a positive FP value the device interprets as the
+       "true" field for the present range. Verify against the bench unit
+       before relying on this in calibration workflows.
+
+    Args:
+        value: Calibration value, positive and finite.
+
+    Raises:
+        CommandError: ``value`` is not positive, not finite, or not numeric.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise CommandError(f"calibration value must be numeric, got {type(value).__name__}")
+    fvalue = float(value)
+    if fvalue != fvalue or fvalue in (float("inf"), float("-inf")):
+        raise CommandError(f"calibration value must be finite, got {value}")
+    if fvalue <= 0:
+        raise CommandError(f"calibration value must be positive, got {value}")
+    return f"C{_format_number(fvalue)}"
+
+
+def l_make_field_equal(value: float) -> str:
+    """Build the ``Ln`` field-scale command (DTM-151 Commands v7.1).
+
+    Adjusts the global scale factor so the *current* field reading equals
+    ``value``. Useful for calibrating a measurement against a reference
+    field of known magnitude.
+
+    Args:
+        value: Target field value (signed FP).
+
+    Raises:
+        CommandError: ``value`` is not finite or not numeric.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise CommandError(f"field-scale value must be numeric, got {type(value).__name__}")
+    fvalue = float(value)
+    if fvalue != fvalue or fvalue in (float("inf"), float("-inf")):
+        raise CommandError(f"field-scale value must be finite, got {value}")
+    return f"L{_format_number(fvalue)}"
+
+
+def sl_set_scale(value: float) -> str:
+    """Build the ``SLn`` global-scale command (DTM-151 Commands v7.1).
+
+    Sets the global scale factor directly. Use :func:`l_make_field_equal`
+    to derive this from a target field reading instead.
+
+    Args:
+        value: Scale factor (signed FP).
+
+    Raises:
+        CommandError: ``value`` is not finite or not numeric.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise CommandError(f"scale factor must be numeric, got {type(value).__name__}")
+    fvalue = float(value)
+    if fvalue != fvalue or fvalue in (float("inf"), float("-inf")):
+        raise CommandError(f"scale factor must be finite, got {value}")
+    return f"SL{_format_number(fvalue)}"
+
+
+def sz_set_zero(value: float) -> str:
+    """Build the ``SZn`` explicit-zero-offset command (DTM-151 Commands v7.1).
+
+    Writes a specific zero-offset value for the current range, in contrast
+    to ``Z`` which uses the device's current reading.
+
+    Args:
+        value: Zero offset (signed FP). Bench-verify the units (the v7.1
+            sheet does not state whether tesla or gauss; likely follows
+            the current display units).
+
+    Raises:
+        CommandError: ``value`` is not finite or not numeric.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise CommandError(f"zero offset must be numeric, got {type(value).__name__}")
+    fvalue = float(value)
+    if fvalue != fvalue or fvalue in (float("inf"), float("-inf")):
+        raise CommandError(f"zero offset must be finite, got {value}")
+    return f"SZ{_format_number(fvalue)}"
+
+
+def u_set_display_units(unit: str) -> str:
+    """Build the ``UF<c>`` display-units command (DTM-151 Commands v7.1).
+
+    Selects gauss (``UFG``) or tesla (``UFT``) for the front-panel
+    display and reply unit suffix. The v7.1 confidential sheet writes
+    the syntax as ``Ufc`` — the ``f`` is a *literal* letter, not a
+    placeholder, and ``c`` is the configurable character (``G`` or ``T``).
+    Bench-verified on FT572EW5 on 2026-05-09: ``UT``/``UG`` are rejected
+    with ``INVALID COMMAND ENTRY``; the device is case-insensitive on the
+    full command (``UFG``/``UFT``/``Ufg``/``Uft`` all work). This builder
+    emits the documented form ``UFG``/``UFT``.
+
+    Args:
+        unit: ``"G"`` for gauss or ``"T"`` for tesla.
+
+    Raises:
+        CommandError: ``unit`` is not ``"G"``/``"T"``/``"g"``/``"t"``.
+    """
+    if not isinstance(unit, str) or len(unit) != 1:
+        raise CommandError(f"unit must be a single char 'G' or 'T', got {unit!r}")
+    upper = unit.upper()
+    if upper not in ("G", "T"):
+        raise CommandError(f"unit must be 'G' or 'T', got {unit!r}")
+    return f"UF{upper}"
 
 
 def o_set_offset(value: float) -> str:

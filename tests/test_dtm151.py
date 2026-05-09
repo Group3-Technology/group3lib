@@ -647,3 +647,197 @@ class TestSendControl:
         fake.queue_reply(b" 0110001100000000\r")  # no echo prefix
         with pytest.raises(ProtocolError, match="echo expected"):
             protocol.send_control(b"\x04", expect_echo=True)
+
+
+# --------------------------------------------------------------------------- #
+# v7.1 customer-accessible commands (PR C)
+# --------------------------------------------------------------------------- #
+
+
+SENT_WA = b"WA\r"
+SENT_WE = b"WE\r"
+SENT_WZ = b"WZ\r"
+SENT_BHELLO = b"BHELLO\r"
+SENT_C_2 = b"C2\r"
+SENT_L_05 = b"L0.5\r"
+SENT_SL_2 = b"SL2\r"
+SENT_SZ_MINUS_1 = b"SZ-1\r"
+SENT_UFG = b"UFG\r"
+SENT_UFT = b"UFT\r"
+SENT_SE0_BARE = b"SE0\r"
+SENT_SE1_BARE = b"SE1\r"
+SENT_CTRL_U = b"\x15"
+SENT_CTRL_X = b"\x18"
+
+
+class TestRawFieldReadouts:
+    def test_post_adc_sends_WA(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.queue_reply(b" 1.234\r")
+        v = dtm.read_raw_field_post_adc()
+        assert fake.sent == [SENT_WA]
+        assert v == pytest.approx(1.234)
+
+    def test_post_cal_sends_WE(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.queue_reply(b" 0.5\r")
+        v = dtm.read_raw_field_post_cal()
+        assert fake.sent == [SENT_WE]
+        assert v == pytest.approx(0.5)
+
+    def test_post_zero_sends_WZ(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.queue_reply(b" -2.5\r")
+        v = dtm.read_raw_field_post_zero()
+        assert fake.sent == [SENT_WZ]
+        assert v == pytest.approx(-2.5)
+
+
+class TestDisplayText:
+    def test_basic(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
+        dtm.display_text("HELLO")
+        assert fake.sent == [SENT_BHELLO]
+
+    def test_max_length(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
+        dtm.display_text("ABCDEFG")  # 7 chars
+        assert fake.sent == [b"BABCDEFG\r"]
+
+    def test_too_long_raises(self, dtm: DTM151Serial) -> None:
+        with pytest.raises(CommandError, match="max length"):
+            dtm.display_text("ABCDEFGH")  # 8 chars
+
+    def test_empty_raises(self, dtm: DTM151Serial) -> None:
+        with pytest.raises(CommandError, match="empty"):
+            dtm.display_text("")
+
+    def test_non_ascii_raises(self, dtm: DTM151Serial) -> None:
+        with pytest.raises(CommandError, match="ASCII"):
+            dtm.display_text("héllo")
+
+
+class TestCalibrationAndScale:
+    def test_calibrate_sends_Cn(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        dtm.calibrate(2)
+        assert fake.sent == [SENT_C_2]
+
+    def test_calibrate_rejects_negative(self, dtm: DTM151Serial) -> None:
+        with pytest.raises(CommandError, match="positive"):
+            dtm.calibrate(-1)
+
+    def test_calibrate_rejects_zero(self, dtm: DTM151Serial) -> None:
+        with pytest.raises(CommandError, match="positive"):
+            dtm.calibrate(0)
+
+    def test_calibrate_rejects_nan(self, dtm: DTM151Serial) -> None:
+        with pytest.raises(CommandError, match="finite"):
+            dtm.calibrate(float("nan"))
+
+    def test_set_field_scale_for_sends_Ln(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        dtm.set_field_scale_for(0.5)
+        assert fake.sent == [SENT_L_05]
+
+    def test_set_field_scale_accepts_negative(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        dtm.set_field_scale_for(-0.5)
+        assert fake.sent == [b"L-0.5\r"]
+
+    def test_set_global_scale_sends_SLn(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        dtm.set_global_scale(2)
+        assert fake.sent == [SENT_SL_2]
+
+    def test_set_zero_sends_SZn(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        dtm.set_zero(-1)
+        assert fake.sent == [SENT_SZ_MINUS_1]
+
+
+class TestDisplayUnitsAndEcho:
+    def test_set_display_units_gauss(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        dtm.set_display_units("G")
+        assert fake.sent == [SENT_UFG]
+
+    def test_set_display_units_tesla(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        dtm.set_display_units("T")
+        assert fake.sent == [SENT_UFT]
+
+    def test_set_display_units_lowercase_accepted(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        dtm.set_display_units("t")
+        assert fake.sent == [SENT_UFT]
+
+    def test_set_display_units_rejects_invalid(self, dtm: DTM151Serial) -> None:
+        with pytest.raises(CommandError, match="must be 'G' or 'T'"):
+            dtm.set_display_units("X")
+
+    def test_set_display_units_rejects_multichar(self, dtm: DTM151Serial) -> None:
+        with pytest.raises(CommandError):
+            dtm.set_display_units("GT")
+
+    def test_set_echo_on_updates_protocol_flag(
+        self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        assert protocol.echo_enabled is False
+        dtm.set_echo(True)
+        assert fake.sent == [SENT_SE1_BARE]
+        assert protocol.echo_enabled is True
+
+    def test_set_echo_off_updates_protocol_flag(
+        self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        protocol.echo_enabled = True
+        # With echo currently on, we need a scripted reply that includes
+        # the echoed body before the ack.
+        fake.queue_reply(b"SE0\n")
+        dtm.set_echo(False)
+        assert fake.sent == [SENT_SE0_BARE]
+        assert protocol.echo_enabled is False
+
+
+class TestRestartAndReset:
+    def test_restart_returns_banner(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.scripted([(SENT_CTRL_U, b" GROUP3 DTMS 7.10\r")])
+        banner = dtm.restart()
+        assert banner == " GROUP3 DTMS 7.10"
+
+    def test_restart_with_echo_on(
+        self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        protocol.echo_enabled = True
+        fake.scripted([(SENT_CTRL_U, b"\x15 GROUP3 DTMS 7.10\r")])
+        banner = dtm.restart()
+        assert banner == " GROUP3 DTMS 7.10"
+
+    def test_reset_to_defaults_swallows_RESET_reply(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        # The device replies "RESET" to confirm — the SDK's check_error
+        # would normally raise ResetError, but reset_to_defaults consumes it.
+        fake.scripted([(SENT_CTRL_X, b" RESET\r")])
+        dtm.reset_to_defaults()  # must not raise
+        assert fake.sent == [SENT_CTRL_X]
+
+    def test_reset_to_defaults_propagates_other_errors(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        # If somehow another error string came back, we should still raise it.
+        fake.scripted([(SENT_CTRL_X, b" OVERFLOW\r")])
+        with pytest.raises(Exception, match="OVERFLOW"):
+            dtm.reset_to_defaults()
