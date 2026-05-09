@@ -185,6 +185,61 @@ class TestAddressedProtocol:
         with pytest.raises(NoProbeError):
             session.select(5).send_setter("Z")
 
+    def test_addressed_send_with_echo_strips_an_prefix_echo(self) -> None:
+        """Regression: with echo on, the echoed ``An`` body must be stripped
+        by ``drain_setter_ack`` rather than treated as an unexpected reply.
+
+        Pre-fix, ``drain_setter_ack`` was not echo-aware: after ``set_echo(True)``
+        the inner protocol's ``echo_enabled`` flag was set, but the addressed
+        send-path drained ``A5`` (the echoed prefix body, terminator suppressed
+        per bench observation) and raised ``ProtocolError`` because the echo
+        bytes don't strip to an empty reply.
+        """
+        fake = FakeTransport()
+        fake.open()
+        # An prefix: device echoes "A5" (terminator suppressed) plus the
+        # bare-LF ack; F: device echoes "F" plus the real reply.
+        fake.queue_reply(b"A5\n")
+        fake.queue_reply(b"F 1.2T\r")
+        protocol = Group3Protocol(fake, echo_enabled=True)
+        session = G3CLSession(protocol)
+        assert session.select(5).send("F") == " 1.2T"
+        assert fake.sent == [SENT_A5, SENT_F]
+
+    def test_addressed_send_with_echo_surfaces_address_rejection(self) -> None:
+        """An echoed ``An`` followed by a §4.5.3 error must still raise the
+        matching :class:`DeviceError` — the echo strip mustn't swallow it.
+        """
+        from group3 import NoProbeError
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_reply(b"A5 NO PROBE\r")
+        protocol = Group3Protocol(fake, echo_enabled=True)
+        session = G3CLSession(protocol)
+        with pytest.raises(NoProbeError):
+            session.select(5).send("F")
+
+    def test_addressed_send_no_reply_with_echo_drains_command_echo(self) -> None:
+        """Regression: with echo on, the addressed command's own echo must be
+        drained so a subsequent read isn't desynchronised.
+
+        Pre-fix, ``AddressedProtocol.send_no_reply`` drained only the ``An``
+        prefix and left ``SM1``'s echo on the wire. The next ``send`` would
+        then drain ``SM1\\n`` while expecting ``A5``'s echo and raise.
+        """
+        fake = FakeTransport()
+        fake.open()
+        # First call: addr.send_no_reply("SM1") with echo on.
+        fake.queue_reply(b"A5\n")    # An echo + bare-LF ack
+        fake.queue_reply(b"SM1\n")   # SM1 echo + bare-LF ack — must be drained
+        # Second call: addr.send("F").
+        fake.queue_reply(b"A5\n")    # An echo + ack for the second select
+        fake.queue_reply(b"F 0.5T\r")  # F echo + reply
+        protocol = Group3Protocol(fake, echo_enabled=True)
+        session = G3CLSession(protocol)
+        session.select(5).send_no_reply("SM1")
+        assert session.select(5).send("F") == " 0.5T"
+
 
 class TestBroadcastTrigger:
     def test_broadcast_trigger_sends_V_without_address(self) -> None:

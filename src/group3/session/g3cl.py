@@ -45,6 +45,16 @@ class AddressedProtocol:
         """Return the G3CL device address this protocol addresses."""
         return self._address
 
+    @property
+    def inner(self) -> Group3Protocol:
+        """Return the underlying point-to-point :class:`Group3Protocol`.
+
+        Used by :meth:`DTM151Serial.set_echo` and similar methods that need
+        to update protocol-wide state (echo, terminator) which lives on the
+        bare protocol, not on the addressed wrapper.
+        """
+        return self._inner
+
     def send(self, command: str, timeout: float | None = None) -> str:
         """Address the device, then send ``command`` and return the reply.
 
@@ -52,13 +62,16 @@ class AddressedProtocol:
         setter on the bench DTM-151-S acks with a bare ``\\n``, and ``An``
         is in the same syntactic class. We therefore drain a possible
         bare-terminator ack synchronously after writing ``An`` so it does
-        not get read as the leading byte of ``command``'s reply. A non-empty
-        non-error reply during the drain raises :class:`ProtocolError`; a
-        §4.5.3 error string raises the matching :class:`DeviceError` (the
-        addressed device rejected the prefix).
+        not get read as the leading byte of ``command``'s reply. With echo
+        enabled the device additionally echoes the ``An`` printable body —
+        ``echo_command`` tells the drain to strip that echo rather than
+        treating it as an unexpected reply. A §4.5.3 error string raises
+        the matching :class:`DeviceError` (the addressed device rejected
+        the prefix).
         """
-        self._inner.send_no_reply(commands.a_set_address(self._address))
-        self._inner.drain_setter_ack()
+        addr_command = commands.a_set_address(self._address)
+        self._inner.send_no_reply(addr_command)
+        self._inner.drain_setter_ack(echo_command=addr_command)
         return self._inner.send(command, timeout=timeout)
 
     def send_setter(self, command: str, error_window: float | None = None) -> None:
@@ -69,8 +82,9 @@ class AddressedProtocol:
         setter's own ack (which would mask a deferred error from the real
         setter — manual §4.5.3).
         """
-        self._inner.send_no_reply(commands.a_set_address(self._address))
-        self._inner.drain_setter_ack()
+        addr_command = commands.a_set_address(self._address)
+        self._inner.send_no_reply(addr_command)
+        self._inner.drain_setter_ack(echo_command=addr_command)
         if error_window is None:
             self._inner.send_setter(command)
         else:
@@ -80,12 +94,19 @@ class AddressedProtocol:
         """Address the device, then send ``command`` without reading a reply.
 
         Drains the ``An`` prefix ack synchronously so it does not pollute
-        the next read. The ``command`` itself is genuinely write-only
-        (e.g. a broadcast trigger), so no further drain is performed.
+        the next read. With echo enabled the device also echoes
+        ``command``'s printable body (and may emit a bare-terminator ack);
+        that echo is drained too, so the next addressed exchange does not
+        misread it as the leading bytes of its own reply. With echo off
+        the second drain is skipped — preserving the fire-and-forget
+        latency for genuinely write-only commands such as ``SMn``.
         """
-        self._inner.send_no_reply(commands.a_set_address(self._address))
-        self._inner.drain_setter_ack()
+        addr_command = commands.a_set_address(self._address)
+        self._inner.send_no_reply(addr_command)
+        self._inner.drain_setter_ack(echo_command=addr_command)
         self._inner.send_no_reply(command)
+        if self._inner.echo_enabled:
+            self._inner.drain_setter_ack(echo_command=command)
 
     # Deliberately no ``read_next`` / ``drain_pending`` here.
     #

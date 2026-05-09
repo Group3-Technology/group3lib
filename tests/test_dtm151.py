@@ -612,6 +612,35 @@ class TestEchoAwareSend:
         with pytest.raises(ProtocolError, match="echo expected"):
             protocol.send_setter("Z")
 
+    def test_send_with_echo_drains_leading_terminator_residue(
+        self, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        """Regression: stale CR/LF before the echo prefix must be drained as
+        residue, not raised as a ProtocolError.
+
+        Pre-fix the echo-prefix ``startswith()`` check ran ahead of the
+        empty-frame recovery loop, so a leftover terminator (from a prior
+        ``send_setter(error_window=0)`` or a multi-byte terminator
+        overflow) caused the echo-validation path to abort before the
+        residue could be absorbed.
+        """
+        protocol.echo_enabled = True
+        fake.queue_reply(b"\r")  # leftover terminator residue
+        fake.queue_reply(b"F 1.2345T\r")  # real echo + reply
+        assert protocol.send("F") == " 1.2345T"
+
+    def test_send_setter_with_echo_drains_leading_terminator_residue(
+        self, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        """Setter analogue: stale CR/LF before the setter's echo must be
+        stripped from the same read buffer rather than failing the echo
+        check.
+        """
+        protocol.echo_enabled = True
+        fake.queue_reply(b"\rZ\n")  # residue + echoed body + bare-LF ack
+        protocol.send_setter("Z")
+        assert fake.sent == [b"Z\r"]
+
 
 class TestSendControl:
     def test_auto_detect_echo_off(

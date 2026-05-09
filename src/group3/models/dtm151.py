@@ -338,11 +338,16 @@ class DTM151Serial:
         important: the device-side change is applied first, then the local
         flag is updated, so a failed ack leaves the protocol in its prior
         consistent state.
+
+        Works on both bare :class:`Group3Protocol` and addressed G3CL
+        sessions (an :class:`AddressedProtocol` exposes its underlying
+        protocol via :attr:`inner` — without that walkthrough, addressed
+        traffic after ``SE1`` would mis-parse the echoed ``An`` prefix).
         """
         self._protocol.send_setter(commands.se_set_echo(enabled))
-        protocol = self._protocol
-        if isinstance(protocol, Group3Protocol):
-            protocol.echo_enabled = enabled
+        underlying = getattr(self._protocol, "inner", self._protocol)
+        if isinstance(underlying, Group3Protocol):
+            underlying.echo_enabled = enabled
 
     # ------------------------------------------------------------------
     # restart / reset (control-byte commands, v7.1 confidential sheet)

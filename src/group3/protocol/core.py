@@ -147,13 +147,41 @@ class Group3Protocol:
         self._pending_tx.clear()
         accumulated_rx = bytearray(raw)
         self._last = _LastExchange(tx=full_tx, rx=raw)
+
+        def _drain_residue(current: bytes) -> bytes:
+            """Discard terminator-only frames until real data arrives.
+
+            Stale terminator residue can come from prior
+            ``send_setter(error_window=0)`` calls, an undrained An-prefix
+            ack, or a multi-byte terminator that overflowed into a second
+            frame. Draining must happen *before* echo-prefix validation —
+            otherwise a leftover CR/LF makes the startswith() check raise
+            ProtocolError instead of being silently absorbed.
+            """
+            while codec.strip_terminators(codec.decode(current)) == "":
+                remaining = _remaining()
+                if remaining is not None and remaining <= 0:
+                    raise Group3TimeoutError(
+                        f"Timed out after {effective_timeout}s with no real "
+                        "reply (only terminator residue arrived)"
+                    )
+                # read_reply requires a concrete float; with no caller-supplied
+                # timeout, fall back to 1 s per drain attempt.
+                next_frame = self.transport.read_reply(
+                    remaining if remaining is not None else 1.0
+                )
+                accumulated_rx.extend(next_frame)
+                self._last = _LastExchange(tx=full_tx, rx=bytes(accumulated_rx))
+                current = next_frame
+            return current
+
+        raw = _drain_residue(raw)
+
         if self.echo_enabled:
             # With echo ON the device echoes the printable bytes of the
             # command (without its trailing terminator — verified on bench
             # unit FT572EW5 on 2026-05-09). The terminator is consumed by
-            # the firmware's command parser and not echoed back, though a
-            # delayed CR/LF sometimes arrives after the reply (absorbed by
-            # the terminator-drain loop below).
+            # the firmware's command parser and not echoed back.
             echo_prefix = _echo_prefix(payload, self.terminator)
             if not raw.startswith(echo_prefix):
                 raise ProtocolError(
@@ -166,40 +194,23 @@ class Group3Protocol:
                 # Echo arrived alone (or with only its own terminator) —
                 # read the actual reply.
                 remaining = _remaining()
-                next_raw = self.transport.read_reply(
+                raw = self.transport.read_reply(
                     remaining if remaining is not None else 1.0
                 )
-                accumulated_rx.extend(next_raw)
+                accumulated_rx.extend(raw)
                 self._last = _LastExchange(tx=full_tx, rx=bytes(accumulated_rx))
-                raw = next_raw
+                raw = _drain_residue(raw)
+
         reply = codec.strip_terminators(codec.decode(raw))
-        if reply == "":
-            # Leading terminator residue (stale setter acks from prior
-            # send_setter(error_window=0) calls, an undrained An-prefix ack,
-            # or a multi-byte terminator that overflowed into a second frame).
-            # Drain any number of terminator-only frames until we see real
-            # data or the *shared* deadline expires.
-            accumulated_rx = bytearray(raw)
-            while reply == "":
-                remaining = _remaining()
-                if remaining is not None and remaining <= 0:
-                    raise Group3TimeoutError(
-                        f"Timed out after {effective_timeout}s with no real "
-                        "reply (only terminator residue arrived)"
-                    )
-                # read_reply requires a concrete float; with no caller-supplied
-                # timeout, fall back to 1 s per drain attempt (same behaviour
-                # as the previous fallback constant).
-                next_raw = self.transport.read_reply(
-                    remaining if remaining is not None else 1.0
-                )
-                accumulated_rx.extend(next_raw)
-                self._last = _LastExchange(tx=full_tx, rx=bytes(accumulated_rx))
-                reply = codec.strip_terminators(codec.decode(next_raw))
         check_error(reply)
         return reply
 
-    def drain_setter_ack(self, window: float = DEFAULT_SETTER_ERROR_WINDOW) -> None:
+    def drain_setter_ack(
+        self,
+        window: float = DEFAULT_SETTER_ERROR_WINDOW,
+        *,
+        echo_command: str | None = None,
+    ) -> None:
         """Synchronously drain a single setter-style ack from the transport.
 
         Used by :class:`AddressedProtocol` after writing the ``An`` prefix
@@ -217,6 +228,15 @@ class Group3Protocol:
           as one combined exchange.
         * The drained bytes update ``last_raw_rx`` for debugging.
 
+        Args:
+            window: Seconds to wait for a deferred ack/error reply.
+            echo_command: When echo is enabled this is the command string
+                whose echo is expected to lead the drained reply (typically
+                the ``An`` prefix the caller just sent via
+                :meth:`send_no_reply`). Without this, an echoed prefix
+                would be misinterpreted as an unexpected reply and raise
+                :class:`ProtocolError`.
+
         If the drained reply is a §4.5.3 error string the corresponding
         :class:`DeviceError` is raised — the addressed device rejected the
         prefix command. A non-empty, non-error reply raises
@@ -227,16 +247,49 @@ class Group3Protocol:
         raw = self.transport.read_optional(window)
         if not raw:
             return
+        accumulated = bytearray(raw)
         # Update only the rx side; preserve _last.tx and _pending_tx so the
         # audit trail of the surrounding exchange (e.g. ``An\rF\r``) is intact.
-        self._last = _LastExchange(tx=self._last.tx, rx=raw)
+        self._last = _LastExchange(tx=self._last.tx, rx=bytes(accumulated))
+
+        # Strip leading terminator residue from a prior exchange before
+        # further validation. A stale CR/LF here would otherwise be misread
+        # as the bare-terminator setter ack of *this* drain, masking a
+        # genuine echo or error string that arrived right behind it.
+        leading = 0
+        while leading < len(raw) and raw[leading : leading + 1] in (codec.CR, codec.LF):
+            leading += 1
+        raw = raw[leading:]
+
+        if self.echo_enabled and echo_command is not None and raw:
+            # The caller just wrote ``echo_command`` via send_no_reply; the
+            # device echoed its printable body (terminator suppressed —
+            # verified on bench unit FT572EW5). Strip that echo before
+            # checking for an error or unexpected reply.
+            payload = codec.encode(echo_command, self.terminator)
+            echo_prefix = _echo_prefix(payload, self.terminator)
+            if not raw.startswith(echo_prefix):
+                raise ProtocolError(
+                    f"echo expected for {echo_command!r} during ack drain "
+                    "but drained bytes do not start with the echoed payload",
+                    raw=bytes(accumulated),
+                )
+            raw = raw[len(echo_prefix):]
+            if not raw:
+                # Echo arrived alone — read the actual ack within the window.
+                tail = self.transport.read_optional(window)
+                if tail:
+                    accumulated.extend(tail)
+                    self._last = _LastExchange(tx=self._last.tx, rx=bytes(accumulated))
+                    raw = tail
+
         reply = codec.strip_terminators(codec.decode(raw))
         if reply == "":
             return  # Bare-terminator ack — the desired path.
         check_error(reply)
         raise ProtocolError(
             f"Unexpected reply during ack drain: {reply!r}",
-            raw=raw,
+            raw=bytes(accumulated),
         )
 
     def drain_pending(self, window: float = 0.05) -> list[bytes]:
@@ -371,6 +424,15 @@ class Group3Protocol:
         accumulated_rx = bytearray()
         raw = self.transport.read_optional(error_window)
         accumulated_rx.extend(raw)
+
+        # Strip leading terminator residue (stale CR/LF from a prior
+        # exchange) so it doesn't fail the echo-prefix check below or get
+        # silently consumed as this setter's bare-terminator ack — masking
+        # a genuine echo or error string queued behind it.
+        leading = 0
+        while leading < len(raw) and raw[leading : leading + 1] in (codec.CR, codec.LF):
+            leading += 1
+        raw = raw[leading:]
 
         if self.echo_enabled and raw:
             # With echo ON the device echoes the printable command body
