@@ -22,17 +22,26 @@ from group3.exceptions import (
     BadTemperatureReadingError,
     CommandError,
     NoTemperatureProbeError,
+    ResetError,
 )
 from group3.protocol import commands
 from group3.protocol.core import Group3Protocol
 from group3.protocol.parser import (
+    parse_baud_code,
     parse_bool_flag,
+    parse_dip_switches,
     parse_float,
     parse_int,
     parse_reading,
     parse_status,
 )
-from group3.types import DeviceMetadataSnapshot, DeviceStatus, Reading, ScriptCommandResult
+from group3.types import (
+    DeviceMetadataSnapshot,
+    DeviceProfile,
+    DeviceStatus,
+    Reading,
+    ScriptCommandResult,
+)
 
 
 @runtime_checkable
@@ -102,6 +111,65 @@ class DTM151Serial:
         self._protocol = protocol
 
     # ------------------------------------------------------------------
+    # connect-time identification
+    # ------------------------------------------------------------------
+
+    def identify(self, coerce_echo_off: bool = True) -> DeviceProfile:
+        """Read the device's DIP-switch state and baud-rate switch.
+
+        Probes the device with ``Ctrl-D`` (``\\x04``) and ``Ctrl-B`` (``\\x02``)
+        to capture its boot-time configuration into a :class:`DeviceProfile`.
+        The echo state is auto-detected from the first reply and recorded on the
+        underlying :class:`Group3Protocol` so subsequent commands strip the echo
+        prefix correctly.
+
+        Recommended as the first call after :meth:`Group3Protocol` is wired to a
+        live transport — both for logging the device profile and for normalising
+        echo state across firmware DIP defaults.
+
+        Args:
+            coerce_echo_off: When ``True`` (default), if the device reports echo
+                ON the method sends ``SE0`` to disable it for the rest of the
+                session. Set ``False`` to leave echo state as the device booted.
+
+        Returns:
+            A :class:`DeviceProfile` snapshot. Note that on G3CL multi-drop
+            sessions the per-device probe is currently unsupported — call
+            :meth:`identify` only on a :class:`DTM151Serial` constructed
+            directly from a :class:`Group3Protocol`.
+
+        Raises:
+            NotImplementedError: ``self._protocol`` is not a
+                :class:`Group3Protocol` (e.g. it's an addressed G3CL protocol).
+            ProtocolError: A reply was not the expected shape — most often a
+                bit-ordering mismatch in the DIP-switch parser (see TODO note in
+                :func:`group3.protocol.parser.parse_dip_switches`).
+        """
+        protocol = self._protocol
+        if not isinstance(protocol, Group3Protocol):
+            raise NotImplementedError(
+                "identify() requires a direct Group3Protocol; G3CL multi-drop "
+                "identification is not supported in this release."
+            )
+        # Drain any S2-1 streaming noise that may have arrived before connect.
+        protocol.drain_pending()
+
+        dip_reply = protocol.send_control(commands.CTRL_D, expect_echo=None)
+        dip = parse_dip_switches(dip_reply)
+
+        # send_control already updated protocol.echo_enabled from the auto-detect.
+        baud_reply = protocol.send_control(
+            commands.CTRL_B, expect_echo=protocol.echo_enabled
+        )
+        baud = parse_baud_code(baud_reply)
+
+        if coerce_echo_off and protocol.echo_enabled:
+            protocol.send_setter(commands.SE0)
+            protocol.echo_enabled = False
+
+        return DeviceProfile(dip=dip, baud=baud, echo_enabled=protocol.echo_enabled)
+
+    # ------------------------------------------------------------------
     # field measurement
     # ------------------------------------------------------------------
 
@@ -164,9 +232,185 @@ class DTM151Serial:
             temperature=temperature,
         )
 
-    def reset_peak(self) -> None:
-        """Reset the peak-hold value to zero (``Q`` command)."""
+    def front_panel_test(self) -> None:
+        """Run the device's front-panel display self-test (``Q`` command).
+
+        Per the DTM-151 v7.1 confidential commands sheet, ``Q`` in base
+        mode triggers a brief visual test of the LED display. The device
+        emits no parsable reply. To reset the peak-hold value use
+        :meth:`erase_peak` (the ``EP`` command).
+        """
         self._protocol.send_setter(commands.Q)
+
+    def display_text(self, text: str) -> None:
+        """Display ``text`` on the front panel (``B<text>`` command).
+
+        Up to 7 ASCII characters. Useful for showing operator-facing
+        status during automated runs.
+        """
+        self._protocol.send_setter(commands.b_display_text(text))
+
+    # ------------------------------------------------------------------
+    # raw-field diagnostic readouts (v7.1 confidential sheet)
+    # ------------------------------------------------------------------
+
+    def read_raw_field_post_adc(self) -> float:
+        """Read the post-ADC raw field value (``WA``).
+
+        Diagnostic reading with no zero, calibration, or scale applied —
+        what the analog board produced before user-configurable corrections.
+        """
+        reply = self._protocol.send(commands.WA)
+        return parse_float(reply)
+
+    def read_raw_field_post_cal(self) -> float:
+        """Read the post-calibration raw field value (``WE``).
+
+        Calibration applied, zero NOT applied. Useful for separating zero
+        drift from calibration drift during diagnostics.
+        """
+        reply = self._protocol.send(commands.WE)
+        return parse_float(reply)
+
+    def read_raw_field_post_zero(self) -> float:
+        """Read the post-zero raw field value (``WZ``).
+
+        Zero applied, calibration NOT applied. Complements :meth:`read_raw_field_post_cal`.
+        """
+        reply = self._protocol.send(commands.WZ)
+        return parse_float(reply)
+
+    # ------------------------------------------------------------------
+    # calibration / scale (v7.1 customer-accessible additions)
+    # ------------------------------------------------------------------
+
+    def calibrate(self, value: float) -> None:
+        """Calibrate the current range against ``value`` (``Cn`` command).
+
+        .. warning::
+           The exact semantic effect of ``Cn`` in base mode is not fully
+           documented in the v7.1 confidential sheet; verify against your
+           hardware before relying on this for production calibration.
+           Use :meth:`set_calibration_factor` (``SCn``) when you have the
+           cal factor itself rather than a reference field value.
+        """
+        self._protocol.send_setter(commands.c_calibrate(value))
+
+    def set_field_scale_for(self, value: float) -> None:
+        """Adjust the global scale so the current field reading equals ``value`` (``Ln``).
+
+        Convenient calibration entry: place the probe in a field of known
+        magnitude, call this with that magnitude, and the device adjusts
+        its global scale factor so the reading matches.
+        """
+        self._protocol.send_setter(commands.l_make_field_equal(value))
+
+    def set_global_scale(self, value: float) -> None:
+        """Set the global scale factor directly (``SLn`` command)."""
+        self._protocol.send_setter(commands.sl_set_scale(value))
+
+    def set_zero(self, value: float) -> None:
+        """Set an explicit zero offset for the current range (``SZn`` command).
+
+        In contrast to :meth:`zero` (the ``Z`` command, which uses the
+        present reading as the zero), this writes the offset value directly.
+        """
+        self._protocol.send_setter(commands.sz_set_zero(value))
+
+    # ------------------------------------------------------------------
+    # display / echo (v7.1 customer-accessible additions)
+    # ------------------------------------------------------------------
+
+    def set_display_units(self, unit: str) -> None:
+        """Set the front-panel display units (``Ufc`` command).
+
+        Args:
+            unit: ``"G"`` for gauss, ``"T"`` for tesla. Case-insensitive.
+        """
+        self._protocol.send_setter(commands.u_set_display_units(unit))
+
+    def set_echo(self, enabled: bool) -> None:
+        """Enable or disable the device's command-echo behaviour (``SEn``).
+
+        Updates the underlying :class:`Group3Protocol`'s :attr:`echo_enabled`
+        flag after the device acknowledges, so subsequent reply parsing
+        strips (or doesn't strip) the echoed prefix correctly. Order is
+        important: the device-side change is applied first, then the local
+        flag is updated, so a failed ack leaves the protocol in its prior
+        consistent state.
+
+        Works on both bare :class:`Group3Protocol` and addressed G3CL
+        sessions (an :class:`AddressedProtocol` exposes its underlying
+        protocol via :attr:`inner` — without that walkthrough, addressed
+        traffic after ``SE1`` would mis-parse the echoed ``An`` prefix).
+        """
+        self._protocol.send_setter(commands.se_set_echo(enabled))
+        underlying = getattr(self._protocol, "inner", self._protocol)
+        if isinstance(underlying, Group3Protocol):
+            underlying.echo_enabled = enabled
+
+    # ------------------------------------------------------------------
+    # restart / reset (control-byte commands, v7.1 confidential sheet)
+    # ------------------------------------------------------------------
+
+    def restart(self) -> str:
+        """Restart the DTM via the ``Ctrl-U`` (``\\x15``) control byte.
+
+        Re-runs the firmware boot sequence and returns the banner string
+        (e.g. ``"GROUP3 DTMS 7.10"``). Numerical user settings are NOT
+        cleared unless DIP S2-8 is ON. Echo state is the device's runtime
+        state from before — the protocol's :attr:`echo_enabled` is not
+        modified.
+
+        Returns:
+            The boot banner string, with leading space and terminator
+            stripped.
+
+        Raises:
+            NotImplementedError: ``self._protocol`` is not a
+                :class:`Group3Protocol` (control bytes are not supported
+                via the addressed G3CL protocol in this release).
+        """
+        protocol = self._protocol
+        if not isinstance(protocol, Group3Protocol):
+            raise NotImplementedError(
+                "restart() requires a direct Group3Protocol; control-byte "
+                "commands are not supported on G3CL multi-drop sessions."
+            )
+        return protocol.send_control(
+            commands.CTRL_U, expect_echo=protocol.echo_enabled
+        )
+
+    def reset_to_defaults(self) -> None:
+        """Reset the DTM to DIP-default configuration via ``Ctrl-X`` (``\\x18``).
+
+        Clears all numerical user settings (calibration factors, zero
+        offsets, scale factors, filter parameters) and reloads the
+        DIP-switch-defined defaults. The device replies with ``"RESET"``,
+        which this method consumes and treats as the success indication
+        rather than the device-error it would otherwise represent.
+
+        .. warning::
+           After this call the protocol's cached :attr:`echo_enabled` may
+           be stale (echo reverts to S2-4's default at reset). Call
+           :meth:`identify` to refresh the profile.
+
+        Raises:
+            NotImplementedError: ``self._protocol`` is not a
+                :class:`Group3Protocol`.
+        """
+        protocol = self._protocol
+        if not isinstance(protocol, Group3Protocol):
+            raise NotImplementedError(
+                "reset_to_defaults() requires a direct Group3Protocol."
+            )
+        # The "RESET" reply is the device confirming the reload — the SDK's
+        # check_error sees it as a §4.5.3 error string, but here it's the
+        # expected success indicator.
+        with suppress(ResetError):
+            protocol.send_control(
+                commands.CTRL_X, expect_echo=protocol.echo_enabled
+            )
 
     # ------------------------------------------------------------------
     # range selection

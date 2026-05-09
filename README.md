@@ -227,7 +227,8 @@ Cross-reference:
 | --- | --- | --- |
 | `F` | `dtm.read_field()` | Field reading |
 | `P` | `dtm.read_peak()` | Peak-hold field |
-| `Q` | `dtm.reset_peak()` | Reset peak-hold |
+| `Q` | `dtm.front_panel_test()` | Front-panel display self-test (v7.1) |
+| `EP` | `dtm.erase_peak()` | Reset peak-hold value |
 | `T` | `dtm.read_temperature()` | Probe temperature (temp-corrected probes) |
 | `Z` / `EZ` | `dtm.zero()` / `dtm.erase_zero()` | Current-range zero |
 | `Rn` / `IR` | `dtm.set_range(n)` / `dtm.get_range()` | 0.3 / 0.6 / 1.2 / 3.0 T |
@@ -245,19 +246,31 @@ Cross-reference:
 | `SMn` | `dtm.set_auto_transmit()`, `dtm.stream_field()` | Auto-transmit (streaming) |
 | `Kn` / `IK` | `dtm.set_sampling_interval()` / `dtm.get_sampling_interval()` | Streaming rate |
 | `SUn` | `dtm.set_send_units()` | Include units in numeric replies |
+| `SEn` | `dtm.set_echo()` | Command-byte echo on/off |
+| `UFG` / `UFT` | `dtm.set_display_units("G"/"T")` | Front-panel display units (v7.1 sheet writes this as `Ufc`) |
+| `B<text>` | `dtm.display_text(text)` | Show up to 7 chars on front panel |
+| `Ln` | `dtm.set_field_scale_for(value)` | Scale: make current reading equal *value* |
+| `SLn` | `dtm.set_global_scale(value)` | Set global scale factor directly |
+| `SZn` | `dtm.set_zero(value)` | Set explicit zero offset (vs `Z` which uses present reading) |
+| `Cn` | `dtm.calibrate(value)` | Live calibration — exact semantics TBC, see docstring |
+| `WA` / `WE` / `WZ` | `dtm.read_raw_field_post_adc()` / `_post_cal()` / `_post_zero()` | Raw-field diagnostics |
+| `Ctrl-D` | `dtm.identify()` | DIP-switch + baud probe (echo auto-detect) |
+| `Ctrl-B` | (via `identify()`) | Baud-rate switch position |
+| `Ctrl-U` | `dtm.restart()` | Restart firmware; returns banner string |
+| `Ctrl-X` | `dtm.reset_to_defaults()` | Reload DIP-defined defaults; clears numerical user settings |
 
 Higher-level helpers built on those commands:
 
 | Helper | Purpose |
 | --- | --- |
+| `dtm.identify()` | Connect-time probe: DIP switches, baud-rate switch, echo state |
 | `dtm.read_metadata_snapshot()` | Temperature + range + filter + `Kn` + `IG` in one call set |
 | `dtm.run_script(text)` | Execute LabVIEW-style concatenated command scripts such as `SU1IRID` |
 
 Commands from the confidentials reference that are **not yet exposed**:
-`ISF` (firmware version), `ISS` (serial number), `SEn` (echo on/off),
-`WA`/`WE`/`WZ` (raw field inspects), and the entire
-calibration submenu (factory-only). These are pending confirmation of which
-commands are customer-facing.
+`ISF` (firmware version), `ISS` (serial number), and the cal-menu /
+manufacturer-only command set (calibration submenu, EEPROM access). The
+v7.1 confidential sheet flags these as not customer-accessible.
 
 ## Testing
 

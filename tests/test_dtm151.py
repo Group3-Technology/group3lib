@@ -11,11 +11,13 @@ import pytest
 
 from group3 import (
     AcquisitionMode,
+    BaudCode,
     CommandError,
     DeviceMetadataSnapshot,
     DTM151Serial,
     FakeTransport,
     FixedRangeProbeError,
+    Group3Protocol,
     MeasurementMode,
     NoProbeError,
     ProtocolError,
@@ -87,9 +89,19 @@ class TestReadings:
         assert fake.sent == [SENT_P]
         assert r.value == pytest.approx(2.9999)
 
-    def test_reset_peak_sends_Q(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
-        dtm.reset_peak()
+    def test_front_panel_test_sends_Q(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        # ``Q`` is the front-panel visual self-test per v7.1 confidential
+        # sheet — peak-hold reset is ``EP`` (see test_erase_peak below).
+        dtm.front_panel_test()
         assert fake.sent == [SENT_Q]
+
+    def test_erase_peak_sends_EP(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        dtm.erase_peak()
+        assert fake.sent == [SENT_EP]
 
     def test_read_temperature_sends_T_and_parses_reply(
         self, dtm: DTM151Serial, fake: FakeTransport
@@ -450,3 +462,411 @@ class TestScriptRunner:
     def test_run_script_rejects_unparseable_text(self, dtm: DTM151Serial) -> None:
         with pytest.raises(CommandError, match="Could not parse"):
             dtm.run_script("HELLO")
+
+
+# --------------------------------------------------------------------------- #
+# Identify (Ctrl-D / Ctrl-B) and echo-aware protocol path
+# --------------------------------------------------------------------------- #
+
+
+# Golden bytes for the connect-time probe.
+SENT_CTRL_D = b"\x04"
+SENT_CTRL_B = b"\x02"
+SENT_SE0 = b"SE0\r"
+
+# Factory defaults: address 0, 7E2, S2-1 ON (transmit every reading), S2-2 ON
+# (CR), S2-3 OFF, S2-4 OFF (echo off), S2-5 OFF (tesla), S2-6 ON (units),
+# S2-7 ON (filter), S2-8 OFF.
+# Bit map (LSB-first per bank): bit 8=S2-1, bit 9=S2-2, bit 13=S2-6, bit 14=S2-7
+# = bits 8 + 9 + 13 + 14 set = 0b0110001100000000.
+DIP_REPLY_FACTORY = b" 0110001100000000\r"
+
+# Same factory but with S2-4 (bit 11) ON — device booted with echo on.
+DIP_REPLY_ECHO_ON = b" 0110101100000000\r"
+
+
+class TestIdentify:
+    def test_factory_defaults_no_echo(
+        self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        fake.scripted(
+            [
+                (SENT_CTRL_D, DIP_REPLY_FACTORY),
+                (SENT_CTRL_B, b" E\r"),
+            ]
+        )
+        profile = dtm.identify()
+        assert fake.sent == [SENT_CTRL_D, SENT_CTRL_B]
+        assert profile.echo_enabled is False
+        assert profile.baud is BaudCode.POS_E
+        assert profile.dip.address == 0
+        assert profile.dip.echo_enabled is False
+        assert profile.dip.terminator_cr is True
+        assert profile.dip.transmit_every_reading is True
+        assert profile.dip.data_format.data_bits == 7
+        assert profile.dip.data_format.parity == "E"
+        assert profile.dip.data_format.stop_bits == 2
+        assert protocol.echo_enabled is False
+
+    def test_echo_on_auto_detected_and_coerced_off(
+        self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        # Device echoes Ctrl-D (control byte echoed verbatim), replies;
+        # echoes Ctrl-B, replies; echoes SE0 (printable body only — the
+        # CR terminator is suppressed per bench observation FT572EW5),
+        # then acks with bare LF. After identify() returns, echo is off.
+        fake.scripted(
+            [
+                (SENT_CTRL_D, b"\x04" + DIP_REPLY_ECHO_ON),
+                (SENT_CTRL_B, b"\x02 E\r"),
+                (SENT_SE0, b"SE0\n"),  # echoed body (no CR) + bare-LF ack
+            ]
+        )
+        profile = dtm.identify()
+        assert fake.sent == [SENT_CTRL_D, SENT_CTRL_B, SENT_SE0]
+        assert profile.echo_enabled is False  # coerced off
+        assert profile.dip.echo_enabled is True  # but DIP says echo on
+        assert protocol.echo_enabled is False
+
+    def test_echo_on_left_alone_when_coerce_disabled(
+        self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        fake.scripted(
+            [
+                (SENT_CTRL_D, b"\x04" + DIP_REPLY_ECHO_ON),
+                (SENT_CTRL_B, b"\x02 F\r"),
+            ]
+        )
+        profile = dtm.identify(coerce_echo_off=False)
+        assert fake.sent == [SENT_CTRL_D, SENT_CTRL_B]
+        assert profile.echo_enabled is True
+        assert profile.baud is BaudCode.POS_F
+        assert protocol.echo_enabled is True
+
+    def test_bench_unit_dip_reply_with_nibble_spaces_parses(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        # Verbatim reply from FT572EW5 on 2026-05-09.
+        bench_reply = b" 0101 0110 0000 0000 \n\r"
+        fake.scripted(
+            [
+                (SENT_CTRL_D, bench_reply),
+                (SENT_CTRL_B, b" E\n\r"),
+            ]
+        )
+        profile = dtm.identify()
+        assert profile.baud is BaudCode.POS_E
+        assert profile.dip.address == 0
+        assert profile.dip.units_gauss is True
+        assert profile.dip.filter_enabled is True
+        assert profile.dip.echo_enabled is False
+
+
+class TestEchoAwareSend:
+    """Group3Protocol with echo_enabled=True must strip echoed prefix bytes."""
+
+    def test_send_with_echo_combined_buffer(
+        self, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        """Echo (printable body, terminator suppressed) and reply merged in one read.
+
+        Bench-verified on FT572EW5 (2026-05-09): the device echoes ``F`` (no
+        ``\\r``) then immediately the reply ` 1.713G` then the terminator pair.
+        """
+        protocol.echo_enabled = True
+        fake.queue_reply(b"F 1.2345T\r")
+        reply = protocol.send("F")
+        assert reply == " 1.2345T"
+
+    def test_send_with_echo_missing_raises(
+        self, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        protocol.echo_enabled = True
+        fake.queue_reply(b" 1.2345T\r")  # no echoed prefix
+        with pytest.raises(ProtocolError, match="echo expected"):
+            protocol.send("F")
+
+    def test_send_setter_with_echo_combined_buffer(
+        self, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        """Setter with echo: echoed body + bare-LF ack arrive together."""
+        protocol.echo_enabled = True
+        fake.queue_reply(b"Z\n")  # echoed body (no CR) + bare-LF ack
+        protocol.send_setter("Z")
+        assert fake.sent == [b"Z\r"]
+
+    def test_send_setter_with_echo_error_path(
+        self, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        protocol.echo_enabled = True
+        # Echoed "R2" + immediate FIXED RANGE PROBE error string.
+        fake.queue_reply(b"R2 FIXED RANGE PROBE\r")
+        with pytest.raises(FixedRangeProbeError):
+            protocol.send_setter("R2")
+
+    def test_send_setter_with_echo_missing_raises(
+        self, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        protocol.echo_enabled = True
+        fake.queue_reply(b" surprise\r")
+        with pytest.raises(ProtocolError, match="echo expected"):
+            protocol.send_setter("Z")
+
+    def test_send_with_echo_drains_leading_terminator_residue(
+        self, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        """Regression: stale CR/LF before the echo prefix must be drained as
+        residue, not raised as a ProtocolError.
+
+        Pre-fix the echo-prefix ``startswith()`` check ran ahead of the
+        empty-frame recovery loop, so a leftover terminator (from a prior
+        ``send_setter(error_window=0)`` or a multi-byte terminator
+        overflow) caused the echo-validation path to abort before the
+        residue could be absorbed.
+        """
+        protocol.echo_enabled = True
+        fake.queue_reply(b"\r")  # leftover terminator residue
+        fake.queue_reply(b"F 1.2345T\r")  # real echo + reply
+        assert protocol.send("F") == " 1.2345T"
+
+    def test_send_setter_with_echo_drains_leading_terminator_residue(
+        self, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        """Setter analogue: stale CR/LF before the setter's echo must be
+        stripped from the same read buffer rather than failing the echo
+        check.
+        """
+        protocol.echo_enabled = True
+        fake.queue_reply(b"\rZ\n")  # residue + echoed body + bare-LF ack
+        protocol.send_setter("Z")
+        assert fake.sent == [b"Z\r"]
+
+
+class TestSendControl:
+    def test_auto_detect_echo_off(
+        self, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        fake.scripted([(b"\x04", b" 0110001100000000\r")])
+        reply = protocol.send_control(b"\x04")
+        assert reply == " 0110001100000000"
+        assert protocol.echo_enabled is False
+
+    def test_auto_detect_echo_on(
+        self, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        # Echoed prefix arrives in the same buffer as the reply.
+        fake.scripted([(b"\x04", b"\x04 0110001100000000\r")])
+        reply = protocol.send_control(b"\x04")
+        assert reply == " 0110001100000000"
+        assert protocol.echo_enabled is True
+
+    def test_auto_detect_echo_on_two_frames(
+        self, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        # Echo arrives alone first; second read picks up the reply.
+        fake.queue_reply(b"\x04")
+        fake.queue_reply(b" 0110001100000000\r")
+        reply = protocol.send_control(b"\x04")
+        assert reply == " 0110001100000000"
+        assert protocol.echo_enabled is True
+
+    def test_expect_echo_true_strict(
+        self, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        fake.queue_reply(b" 0110001100000000\r")  # no echo prefix
+        with pytest.raises(ProtocolError, match="echo expected"):
+            protocol.send_control(b"\x04", expect_echo=True)
+
+
+# --------------------------------------------------------------------------- #
+# v7.1 customer-accessible commands (PR C)
+# --------------------------------------------------------------------------- #
+
+
+SENT_WA = b"WA\r"
+SENT_WE = b"WE\r"
+SENT_WZ = b"WZ\r"
+SENT_BHELLO = b"BHELLO\r"
+SENT_C_2 = b"C2\r"
+SENT_L_05 = b"L0.5\r"
+SENT_SL_2 = b"SL2\r"
+SENT_SZ_MINUS_1 = b"SZ-1\r"
+SENT_UFG = b"UFG\r"
+SENT_UFT = b"UFT\r"
+SENT_SE0_BARE = b"SE0\r"
+SENT_SE1_BARE = b"SE1\r"
+SENT_CTRL_U = b"\x15"
+SENT_CTRL_X = b"\x18"
+
+
+class TestRawFieldReadouts:
+    def test_post_adc_sends_WA(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.queue_reply(b" 1.234\r")
+        v = dtm.read_raw_field_post_adc()
+        assert fake.sent == [SENT_WA]
+        assert v == pytest.approx(1.234)
+
+    def test_post_cal_sends_WE(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.queue_reply(b" 0.5\r")
+        v = dtm.read_raw_field_post_cal()
+        assert fake.sent == [SENT_WE]
+        assert v == pytest.approx(0.5)
+
+    def test_post_zero_sends_WZ(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.queue_reply(b" -2.5\r")
+        v = dtm.read_raw_field_post_zero()
+        assert fake.sent == [SENT_WZ]
+        assert v == pytest.approx(-2.5)
+
+
+class TestDisplayText:
+    def test_basic(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
+        dtm.display_text("HELLO")
+        assert fake.sent == [SENT_BHELLO]
+
+    def test_max_length(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
+        dtm.display_text("ABCDEFG")  # 7 chars
+        assert fake.sent == [b"BABCDEFG\r"]
+
+    def test_too_long_raises(self, dtm: DTM151Serial) -> None:
+        with pytest.raises(CommandError, match="max length"):
+            dtm.display_text("ABCDEFGH")  # 8 chars
+
+    def test_empty_raises(self, dtm: DTM151Serial) -> None:
+        with pytest.raises(CommandError, match="empty"):
+            dtm.display_text("")
+
+    def test_non_ascii_raises(self, dtm: DTM151Serial) -> None:
+        with pytest.raises(CommandError, match="ASCII"):
+            dtm.display_text("héllo")
+
+
+class TestCalibrationAndScale:
+    def test_calibrate_sends_Cn(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        dtm.calibrate(2)
+        assert fake.sent == [SENT_C_2]
+
+    def test_calibrate_rejects_negative(self, dtm: DTM151Serial) -> None:
+        with pytest.raises(CommandError, match="positive"):
+            dtm.calibrate(-1)
+
+    def test_calibrate_rejects_zero(self, dtm: DTM151Serial) -> None:
+        with pytest.raises(CommandError, match="positive"):
+            dtm.calibrate(0)
+
+    def test_calibrate_rejects_nan(self, dtm: DTM151Serial) -> None:
+        with pytest.raises(CommandError, match="finite"):
+            dtm.calibrate(float("nan"))
+
+    def test_set_field_scale_for_sends_Ln(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        dtm.set_field_scale_for(0.5)
+        assert fake.sent == [SENT_L_05]
+
+    def test_set_field_scale_accepts_negative(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        dtm.set_field_scale_for(-0.5)
+        assert fake.sent == [b"L-0.5\r"]
+
+    def test_set_global_scale_sends_SLn(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        dtm.set_global_scale(2)
+        assert fake.sent == [SENT_SL_2]
+
+    def test_set_zero_sends_SZn(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        dtm.set_zero(-1)
+        assert fake.sent == [SENT_SZ_MINUS_1]
+
+
+class TestDisplayUnitsAndEcho:
+    def test_set_display_units_gauss(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        dtm.set_display_units("G")
+        assert fake.sent == [SENT_UFG]
+
+    def test_set_display_units_tesla(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        dtm.set_display_units("T")
+        assert fake.sent == [SENT_UFT]
+
+    def test_set_display_units_lowercase_accepted(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        dtm.set_display_units("t")
+        assert fake.sent == [SENT_UFT]
+
+    def test_set_display_units_rejects_invalid(self, dtm: DTM151Serial) -> None:
+        with pytest.raises(CommandError, match="must be 'G' or 'T'"):
+            dtm.set_display_units("X")
+
+    def test_set_display_units_rejects_multichar(self, dtm: DTM151Serial) -> None:
+        with pytest.raises(CommandError):
+            dtm.set_display_units("GT")
+
+    def test_set_echo_on_updates_protocol_flag(
+        self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        assert protocol.echo_enabled is False
+        dtm.set_echo(True)
+        assert fake.sent == [SENT_SE1_BARE]
+        assert protocol.echo_enabled is True
+
+    def test_set_echo_off_updates_protocol_flag(
+        self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        protocol.echo_enabled = True
+        # With echo currently on, we need a scripted reply that includes
+        # the echoed body before the ack.
+        fake.queue_reply(b"SE0\n")
+        dtm.set_echo(False)
+        assert fake.sent == [SENT_SE0_BARE]
+        assert protocol.echo_enabled is False
+
+
+class TestRestartAndReset:
+    def test_restart_returns_banner(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.scripted([(SENT_CTRL_U, b" GROUP3 DTMS 7.10\r")])
+        banner = dtm.restart()
+        assert banner == " GROUP3 DTMS 7.10"
+
+    def test_restart_with_echo_on(
+        self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        protocol.echo_enabled = True
+        fake.scripted([(SENT_CTRL_U, b"\x15 GROUP3 DTMS 7.10\r")])
+        banner = dtm.restart()
+        assert banner == " GROUP3 DTMS 7.10"
+
+    def test_reset_to_defaults_swallows_RESET_reply(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        # The device replies "RESET" to confirm — the SDK's check_error
+        # would normally raise ResetError, but reset_to_defaults consumes it.
+        fake.scripted([(SENT_CTRL_X, b" RESET\r")])
+        dtm.reset_to_defaults()  # must not raise
+        assert fake.sent == [SENT_CTRL_X]
+
+    def test_reset_to_defaults_propagates_other_errors(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        # If somehow another error string came back, we should still raise it.
+        fake.scripted([(SENT_CTRL_X, b" OVERFLOW\r")])
+        with pytest.raises(Exception, match="OVERFLOW"):
+            dtm.reset_to_defaults()
