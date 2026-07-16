@@ -26,8 +26,8 @@ from group3.exceptions import CommandError
 
 F: Final = "F"  # Field reading — current selected range.
 P: Final = "P"  # Peak hold field reading.
-Q: Final = "Q"  # Test DTM front-panel display (visual self-test). Per v7.1
-                # confidential commands sheet — base mode only. Peak-hold
+Q: Final = "Q"  # Test DTM front-panel display (visual self-test). Per the
+                # vendor command reference — base mode only. Peak-hold
                 # reset is ``EP``, exposed as :meth:`DTM151Serial.erase_peak`.
 T: Final = "T"  # Temperature reading from the probe's temperature sensor.
 
@@ -72,22 +72,22 @@ NH: Final = "NH"  # Display mode: hold (peak).
 NN: Final = "NN"  # Display mode: normal (field).
 NT: Final = "NT"  # Display mode: temperature.
 
-# Send-mode / streaming control (DTM-151 Commands v7.1, Send Mode row).
+# Send-mode / streaming control (vendor command reference, Send Mode row).
 SM0: Final = "SM0"  # Send mode: F-Request. Device replies only when host sends F.
 SM1: Final = "SM1"  # Send mode: Timed. Device auto-transmits every Kn seconds.
 
-# Echo control (DTM-151 Commands v7.1, Turn Echo ON/OFF row).
+# Echo control (vendor command reference, Turn Echo ON/OFF row).
 SE0: Final = "SE0"  # Echo OFF — device does not echo command bytes before replies.
 SE1: Final = "SE1"  # Echo ON — device echoes every command byte first.
 
-# Raw-field diagnostic readouts (DTM-151 Commands v7.1).
-# Reply is FP per the confidential sheet — same shape as F/P.
+# Raw-field diagnostic readouts (vendor command reference).
+# Reply is FP — same shape as F/P.
 WA: Final = "WA"  # Raw field reading post-ADC (no zero/cal/scale applied).
 WE: Final = "WE"  # Raw field reading post-cal (zero NOT applied).
 WZ: Final = "WZ"  # Raw field reading post-zero (cal NOT applied).
 
 # -----------------------------------------------------------------------------
-# Control-byte commands (DTM-151 Commands v7.1).
+# Control-byte commands (vendor command reference).
 #
 # Unlike the ASCII commands above, these are single non-printable bytes sent
 # WITHOUT a terminator. The device's reply still ends with the configured
@@ -192,7 +192,7 @@ def y_set_filter_window(value: float) -> str:
 
 
 def sm_set_send_mode(enabled: bool) -> str:
-    """Build the ``SMn`` send-mode command (DTM-151 Commands v7.1).
+    """Build the ``SMn`` send-mode command (vendor command reference).
 
     Args:
         enabled: ``True`` selects ``SM1`` (Timed — device auto-transmits every
@@ -208,7 +208,7 @@ def sm_set_send_mode(enabled: bool) -> str:
 
 
 def se_set_echo(enabled: bool) -> str:
-    """Build the ``SEn`` echo-on/off command (DTM-151 Commands v7.1).
+    """Build the ``SEn`` echo-on/off command (vendor command reference).
 
     With echo ON the device echoes every command byte before transmitting the
     reply. The protocol layer strips this prefix when
@@ -224,7 +224,7 @@ def se_set_echo(enabled: bool) -> str:
 
 
 def su_set_send_units(enabled: bool) -> str:
-    """Build the ``SUn`` send-units command (DTM-151 Commands v7.1).
+    """Build the ``SUn`` send-units command (vendor command reference).
 
     Args:
         enabled: ``True`` selects ``SU1`` so numeric replies include unit suffixes
@@ -236,7 +236,7 @@ def su_set_send_units(enabled: bool) -> str:
 
 
 def k_set_sampling_rate(seconds: int) -> str:
-    """Build the ``Kn`` sampling-rate command (DTM-151 Commands v7.1).
+    """Build the ``Kn`` sampling-rate command (vendor command reference).
 
     Controls how often the device auto-transmits a reading when ``SM1`` is
     active. ``0`` means "every reading" — the internal 10 Hz measurement
@@ -278,10 +278,10 @@ def sc_set_calibration(factor: float) -> str:
 
 
 def b_display_text(text: str) -> str:
-    """Build the ``B<text>`` display-text command (DTM-151 Commands v7.1).
+    """Build the ``B<text>`` display-text command (vendor command reference).
 
     Writes up to 7 ASCII characters to the front-panel display. The
-    confidential commands sheet notes that a terminator is required if
+    vendor command reference notes that a terminator is required if
     fewer than 7 chars are sent — the codec always appends one, so this
     works either way.
 
@@ -308,7 +308,7 @@ def b_display_text(text: str) -> str:
 
 
 def c_calibrate(value: float) -> str:
-    """Build the ``Cn`` live-calibration command (DTM-151 Commands v7.1).
+    """Build the ``Cn`` live-calibration command (vendor command reference).
 
     Customer-accessible base-mode calibration entry. Distinct from the
     cal-menu ``C`` (no-arg) and from ``SCn`` (calibration-factor write).
@@ -337,7 +337,7 @@ def c_calibrate(value: float) -> str:
 
 
 def l_make_field_equal(value: float) -> str:
-    """Build the ``Ln`` field-scale command (DTM-151 Commands v7.1).
+    """Build the ``Ln`` field-scale command (vendor command reference).
 
     Adjusts the global scale factor so the *current* field reading equals
     ``value``. Useful for calibrating a measurement against a reference
@@ -358,7 +358,7 @@ def l_make_field_equal(value: float) -> str:
 
 
 def sl_set_scale(value: float) -> str:
-    """Build the ``SLn`` global-scale command (DTM-151 Commands v7.1).
+    """Build the ``SLn`` global-scale command (vendor command reference).
 
     Sets the global scale factor directly. Use :func:`l_make_field_equal`
     to derive this from a target field reading instead.
@@ -378,7 +378,7 @@ def sl_set_scale(value: float) -> str:
 
 
 def sz_set_zero(value: float) -> str:
-    """Build the ``SZn`` explicit-zero-offset command (DTM-151 Commands v7.1).
+    """Build the ``SZn`` explicit-zero-offset command (vendor command reference).
 
     Writes a specific zero-offset value for the current range, in contrast
     to ``Z`` which uses the device's current reading.
@@ -400,10 +400,10 @@ def sz_set_zero(value: float) -> str:
 
 
 def u_set_display_units(unit: str) -> str:
-    """Build the ``UF<c>`` display-units command (DTM-151 Commands v7.1).
+    """Build the ``UF<c>`` display-units command (vendor command reference).
 
     Selects gauss (``UFG``) or tesla (``UFT``) for the front-panel
-    display and reply unit suffix. The v7.1 confidential sheet writes
+    display and reply unit suffix. The vendor command reference writes
     the syntax as ``Ufc`` — the ``f`` is a *literal* letter, not a
     placeholder, and ``c`` is the configurable character (``G`` or ``T``).
     Bench-verified on FT572EW5 on 2026-05-09: ``UT``/``UG`` are rejected

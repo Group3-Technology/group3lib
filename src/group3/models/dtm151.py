@@ -195,8 +195,7 @@ class DTM151Serial:
         The reply format matches :meth:`read_field` — a floating-point value
         with an optional ``C`` unit suffix when ``SUn``/S2-6 is enabled.
 
-        Source: ``manuals/DTM-151 v7.1 Commands -Confidential.pdf`` (row
-        "Temperature Reading: Request").
+        Source: vendor command reference (row "Temperature Reading: Request").
         """
         reply = self._protocol.send(commands.T)
         return parse_reading(reply)
@@ -235,7 +234,7 @@ class DTM151Serial:
     def front_panel_test(self) -> None:
         """Run the device's front-panel display self-test (``Q`` command).
 
-        Per the DTM-151 v7.1 confidential commands sheet, ``Q`` in base
+        Per the vendor command reference, ``Q`` in base
         mode triggers a brief visual test of the LED display. The device
         emits no parsable reply. To reset the peak-hold value use
         :meth:`erase_peak` (the ``EP`` command).
@@ -251,7 +250,7 @@ class DTM151Serial:
         self._protocol.send_setter(commands.b_display_text(text))
 
     # ------------------------------------------------------------------
-    # raw-field diagnostic readouts (v7.1 confidential sheet)
+    # raw-field diagnostic readouts (vendor command reference)
     # ------------------------------------------------------------------
 
     def read_raw_field_post_adc(self) -> float:
@@ -289,7 +288,7 @@ class DTM151Serial:
 
         .. warning::
            The exact semantic effect of ``Cn`` in base mode is not fully
-           documented in the v7.1 confidential sheet; verify against your
+           documented in the vendor command reference; verify against your
            hardware before relying on this for production calibration.
            Use :meth:`set_calibration_factor` (``SCn``) when you have the
            cal factor itself rather than a reference field value.
@@ -350,7 +349,7 @@ class DTM151Serial:
             underlying.echo_enabled = enabled
 
     # ------------------------------------------------------------------
-    # restart / reset (control-byte commands, v7.1 confidential sheet)
+    # restart / reset (control-byte commands, vendor command reference)
     # ------------------------------------------------------------------
 
     def restart(self) -> str:
@@ -585,7 +584,7 @@ class DTM151Serial:
         control the rate, or :meth:`stream_field` as the higher-level
         context-managed API.
 
-        Per the DTM-151 Commands v7.1 reference, ``SMn`` is documented as
+        Per the vendor command reference, ``SMn`` is documented as
         producing no reply (``GET_DATA=n``, ``GET_TERM=n``) — so unlike
         other setters we do not drain for a deferred error. After ``SM1``
         the next bytes on the bus are real streaming readings, not an
@@ -645,7 +644,7 @@ class DTM151Serial:
 
         Args:
             interval_seconds: Seconds between readings — the ``Kn`` parameter
-                (DTM-151 Commands v7.1). Pass ``0`` for the device's internal
+                (vendor command reference). Pass ``0`` for the device's internal
                 maximum rate (every measurement, 10 Hz); pass ``1`` for 1 Hz,
                 ``60`` for once per minute, and so on up to ``65534``. If
                 omitted, the device's existing ``Kn`` is used unchanged. The
@@ -793,7 +792,7 @@ class FieldStream:
         """
         if self._paused:
             raise RuntimeError("FieldStream is already paused")
-        # SMn is documented as producing no reply (DTM-151 Commands v7.1).
+        # SMn is documented as producing no reply (vendor command reference).
         # Use send_no_reply rather than send_setter so the setter-drain does
         # not accidentally consume an in-flight streaming reading as an
         # "unexpected setter reply". drain_pending below handles cleanup.

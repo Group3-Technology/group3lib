@@ -231,12 +231,12 @@ def parse_status(reply: str) -> DeviceStatus:
 def parse_dip_switches(reply: str) -> DipSwitches:
     """Parse the 16-bit binary reply from the ``Ctrl-D`` (``\\x04``) command.
 
-    The DTM-151 v7.1 confidential commands sheet documents this reply as a
+    The vendor command reference documents this reply as a
     "16-bit binary number". Every documented teslameter reply starts with a
     space (manual section 4.5.2); this parser tolerates an optional leading
     space and requires exactly 16 ``0``/``1`` characters.
 
-    Verified against an Antala bench unit (FT572EW5) on 2026-05-09:
+    Verified against bench unit FT572EW5 on 2026-05-09:
     the firmware formats the reply as ``" 0101 0110 0000 0000 \\n\\r"`` —
     four space-separated 4-bit nibbles plus a trailing space — so this
     parser strips **all** whitespace, not just leading/trailing. Bit
@@ -326,7 +326,7 @@ def parse_baud_code(reply: str) -> BaudCode:
     """Parse the single hex-character reply from the ``Ctrl-B`` (``\\x02``) command.
 
     Manual Table 7 (page 3-12) lists 16 switch positions ``0..F`` mapping to
-    50 baud through 19200 baud. The v7.1 confidential sheet documents the
+    50 baud through 19200 baud. The vendor command reference documents the
     reply as ``"char: A…F"`` — likely a typo for ``0..F``; this parser
     accepts the full range. Leading space (manual §4.5.2) is tolerated.
 

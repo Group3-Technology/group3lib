@@ -110,7 +110,7 @@ class TestParseReading:
         assert r.unit is Unit.TESLA
 
     def test_celsius_suffix(self) -> None:
-        """Temperature replies use a C suffix (DTM-151 Commands v7.1, T row)."""
+        """Temperature replies use a C suffix (vendor command reference, T row)."""
         r = parse_reading(" 23.5C")
         assert r.value == pytest.approx(23.5)
         assert r.unit is Unit.CELSIUS

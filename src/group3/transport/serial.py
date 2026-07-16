@@ -8,7 +8,7 @@ we raise a clear ``ImportError`` pointing the user at the extras group.
 The DTM-151-S accepts configurable serial parameters set by internal DIP switches
 (manual section 3.6). ``SerialTransport`` defaults to **9600 baud, 7E2,
 no flow control** — the factory default shipped by Group3 Technology
-(verified against an Antala bench unit). Override ``bytesize``, ``parity``,
+(verified against a bench unit). Override ``bytesize``, ``parity``,
 ``stopbits`` for non-default DIP-switch settings.
 
 Reply-terminator handling follows manual §3.6: the final terminator is either CR

@@ -135,7 +135,7 @@ class SerialDataFormat:
 class DipSwitches:
     """Decoded DIP-switch state from the ``Ctrl-D`` (``\\x04``) reply.
 
-    The reply is documented in the DTM-151 v7.1 confidential commands sheet as a
+    The reply is documented in the vendor command reference as a
     "16-bit binary number" — one bit per switch across the S1 (8) and S2 (8) banks
     documented in manual Tables 4 and 5 (pages 3-10/3-11).
 
@@ -190,7 +190,7 @@ class BaudCode(IntEnum):
     2 — the manual lists 134.5 baud).
 
     .. warning::
-       TODO(bench): the v7.1 confidential sheet documents the Ctrl-B reply as
+       TODO(bench): the vendor command reference documents the Ctrl-B reply as
        ``"char: A…F"``, but Table 7 of the manual lists the full hex range
        ``0..F``. The parser accepts the full range; verify on bench whether real
        firmware also returns ``0..9`` or only ``A..F``.
