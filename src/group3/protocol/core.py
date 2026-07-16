@@ -489,7 +489,7 @@ class Group3Protocol:
     ) -> str:
         """Send a single control-byte command (e.g. ``Ctrl-D``) and return the reply.
 
-        The DTM-151 v7.1 confidential commands sheet lists four control-character
+        The vendor command reference lists four control-character
         commands (``\\x02``/``\\x04``/``\\x15``/``\\x18`` in
         :mod:`group3.protocol.commands`) that are sent as raw bytes **without** a
         terminator. The reply still ends with the device's configured terminator.

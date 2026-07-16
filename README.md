@@ -16,20 +16,20 @@ without it.
 ### From a released wheel
 
 Tagged versions are published to the project's
-[GitHub Releases page](https://github.com/antala-co/group3lib/releases) by the
+[GitHub Releases page](https://github.com/Group3-Technology/group3lib/releases) by the
 [`Release`](.github/workflows/release.yml) workflow. Each release attaches a
 `group3lib-<version>-py3-none-any.whl` and a matching `.tar.gz` sdist.
 
 Replace `<VERSION>` below with the release tag (e.g. `0.X.Y`) — see the
-[Releases page](https://github.com/antala-co/group3lib/releases) for the
+[Releases page](https://github.com/Group3-Technology/group3lib/releases) for the
 latest tag.
 
 ```bash
 # Core library only (no pyserial):
-pip install https://github.com/antala-co/group3lib/releases/download/v<VERSION>/group3lib-<VERSION>-py3-none-any.whl
+pip install https://github.com/Group3-Technology/group3lib/releases/download/v<VERSION>/group3lib-<VERSION>-py3-none-any.whl
 
 # With pyserial for real RS-232 / fiber-optic hardware:
-pip install "group3lib[serial] @ https://github.com/antala-co/group3lib/releases/download/v<VERSION>/group3lib-<VERSION>-py3-none-any.whl"
+pip install "group3lib[serial] @ https://github.com/Group3-Technology/group3lib/releases/download/v<VERSION>/group3lib-<VERSION>-py3-none-any.whl"
 
 # Or download the wheel locally and install it:
 pip install ./group3lib-<VERSION>-py3-none-any.whl
@@ -315,7 +315,7 @@ Other inherited assumptions worth confirming on your unit's DIP-switch settings
 (manual section 3.6):
 
 - **Serial params**: factory default is `9600 7E2`, no flow control (verified
-  against an Antala bench unit), and `SerialTransport` defaults match. Pass
+  against a bench unit), and `SerialTransport` defaults match. Pass
   `bytesize=8, parity="N", stopbits=1` for a unit reconfigured to 8N1, or use
   the `--bytesize/--parity/--stopbits` flags on the example scripts. The
   DTM-151-S is fully DIP-switch-configurable between 50 and 19200 baud.

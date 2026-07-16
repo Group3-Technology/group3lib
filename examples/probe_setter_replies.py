@@ -49,7 +49,7 @@ def _safe_setters() -> list[str]:
         commands.GC,
         commands.GV,
         commands.GC,  # restore
-        commands.Q,  # front-panel display self-test (v7.1 confidential sheet)
+        commands.Q,  # front-panel display self-test (vendor command reference)
     ]
 
 
