@@ -133,6 +133,51 @@ class TestStreamField:
                     break
         assert values == [pytest.approx(0.10), pytest.approx(0.20), pytest.approx(0.30)]
 
+    def test_loop_link_absorbs_returned_SM1_before_reading(
+        self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        """On a returning link the SM1 ripple must not be read as a reading.
+
+        Bench-observed on an FTR fiber-optic link (2026-07-26): SM1 goes out
+        write-only, the loop ripples ``SM1\\r`` back with a bare-LF ack, and
+        the first streaming read parsed it — ProtocolError "Expected numeric
+        field reply, got 'SM1'".
+        """
+        protocol.expect_command_returned = True
+        fake.queue_reply(b"SM1\r\n")  # ripple (terminator included) + ack
+        fake.queue_reply(b" 0.10T\r")
+        fake.queue_reply(b" 0.20T\r")
+        values: list[float] = []
+        with dtm.stream_field() as stream:
+            for reading in stream:
+                values.append(reading.value)
+                if len(values) == 2:
+                    break
+        assert values == [pytest.approx(0.10), pytest.approx(0.20)]
+        assert fake.sent == [SENT_SM1, SENT_SM0]
+
+    def test_loop_link_absorbs_returned_SM1_on_resume(
+        self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        """Same for the SM1 re-issued when a paused() block exits."""
+        protocol.expect_command_returned = True
+        fake.queue_reply(b"SM1\r\n")  # ripple + ack for the opening SM1
+        fake.queue_reply(b" 0.10T\r")
+        values: list[float] = []
+        with dtm.stream_field() as stream:
+            for reading in stream:
+                values.append(reading.value)
+                with stream.paused():
+                    fake.queue_reply(b"IR 2\r")  # echoed IR + range reply
+                    assert dtm.get_range() == 2
+                    fake.queue_reply(b"SM1\r\n")  # ripple + ack on resume
+                    fake.queue_reply(b" 0.20T\r")
+                break
+            for reading in stream:
+                values.append(reading.value)
+                break
+        assert values == [pytest.approx(0.10), pytest.approx(0.20)]
+
     def test_interval_seconds_sets_and_restores_Kn(
         self, dtm: DTM151Serial, fake: FakeTransport
     ) -> None:

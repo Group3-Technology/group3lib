@@ -73,8 +73,8 @@ any OS — there is no native code to compile.
 2. Merge to `main` (CI must be green).
 3. Tag and push:
    ```bash
-   git tag v0.3.0
-   git push origin v0.3.0
+   git tag vX.Y.Z
+   git push origin vX.Y.Z
    ```
 4. The Release workflow builds and attaches the artifacts to a new GitHub
    Release. If the tag and `pyproject.toml` version disagree, the workflow
@@ -98,9 +98,47 @@ from group3 import DTM151Serial, Group3Protocol, SerialTransport
 
 with SerialTransport("/dev/cu.usbserial-1") as transport:
     dtm = DTM151Serial(Group3Protocol(transport))
+    dtm.identify()          # connect-time probe — see "Fiber-optic (FTR)" below
     reading = dtm.read_field()
     print(f"{reading.value} {reading.unit.value}")
 ```
+
+`identify()` is optional on a plain point-to-point RS-232 link with echo off,
+and required on anything that returns commands — a fiber-optic/G3CL link, or a
+device with DIP S2-4 echo ON. Make it your first call and neither case can
+surprise you.
+
+### Fiber-optic (FTR) and echo-enabled links
+
+On a fiber-optic link the host sits on a Group3 Communication Loop, and the loop
+retransmits every command back to the host ahead of its reply (manual §4.5.1,
+page 4-7). A device with DIP S2-4 echo ON does the same thing over plain RS-232.
+Either way the protocol has to expect the returned command. Call `identify()`
+once after connecting — it probes, and repairs the link if it needs repairing:
+
+```python
+dtm = DTM151Serial(Group3Protocol(transport))
+profile = dtm.identify()    # probes; sends SE0 if the device is echoing
+reading = dtm.read_field()
+
+profile.command_returned    # True: commands come back before their reply
+profile.loop_echo           # True: it is the loop, so SE0 cannot stop it
+```
+
+Skip it on such a link and the first reply is your own command coming back; the
+SDK raises a `ProtocolError` naming that cause rather than failing downstream in
+the parser.
+
+**Use `identify()`, not `detect_command_echo()`, as the connect-time call.** The
+latter only *detects* — it reports whether commands come back and configures the
+protocol accordingly, which is enough for a loop-only link. It is **not** enough
+when the device also has S2-4 echo ON *over* a loop: the command then comes back
+twice (manual §3.6, page 3-11), and on real hardware the echoed ASCII copy
+arrives corrupted (bench-observed: `F` returned as `|`), so no amount of
+prefix-stripping recovers it. Only the `SE0` that `identify()` sends makes such a
+link usable — control-byte probes stay clean, which is what lets the repair get
+through. `SE0` clears the device's echo but cannot stop the loop, so `identify()`
+re-probes afterwards and reports the remaining return as `profile.loop_echo`.
 
 Set a range, zero, and take a triggered measurement:
 
@@ -186,7 +224,12 @@ Up to 31 Group3 devices share a single G3CL loop, addressed 0..30:
 from group3 import G3CLSession, Group3Protocol, SerialTransport
 
 with SerialTransport("/dev/cu.usbserial-1") as transport:
-    session = G3CLSession(Group3Protocol(transport))
+    # A multi-drop G3CL is a loop by construction, so commands always come
+    # back before their replies — declare it rather than probing. Don't call
+    # identify() here: its Ctrl-D/Ctrl-B probes are unaddressed, so every
+    # device on the loop would answer at once.
+    protocol = Group3Protocol(transport, expect_command_returned=True)
+    session = G3CLSession(protocol)
 
     probe_a = session.device(address=0)
     probe_b = session.device(address=5)
@@ -249,8 +292,8 @@ Cross-reference: `manuals/DTM-151-S Manual_v7.1.pdf` (Table 9, §4.5–4.7).
 | `SZn` | `dtm.set_zero(value)` | Set explicit zero offset (vs `Z` which uses present reading) |
 | `Cn` | `dtm.calibrate(value)` | Live calibration — exact semantics TBC, see docstring |
 | `WA` / `WE` / `WZ` | `dtm.read_raw_field_post_adc()` / `_post_cal()` / `_post_zero()` | Raw-field diagnostics |
-| `Ctrl-D` | `dtm.identify()` | DIP-switch + baud probe (echo auto-detect) |
-| `Ctrl-B` | (via `identify()`) | Baud-rate switch position |
+| `Ctrl-D` | `dtm.identify()` | DIP-switch + baud probe; normalises echo state |
+| `Ctrl-B` | (via `identify()`) | Baud-rate switch position; also `dtm.detect_command_echo()` |
 | `Ctrl-U` | `dtm.restart()` | Restart firmware; returns banner string |
 | `Ctrl-X` | `dtm.reset_to_defaults()` | Reload DIP-defined defaults; clears numerical user settings |
 
@@ -258,7 +301,8 @@ Higher-level helpers built on those commands:
 
 | Helper | Purpose |
 | --- | --- |
-| `dtm.identify()` | Connect-time probe: DIP switches, baud-rate switch, echo state |
+| `dtm.identify()` | **Connect-time call**: DIP switches, baud-rate switch, and whether commands are returned — repairs an echoing link |
+| `dtm.detect_command_echo()` | Detection only — reports a returned-command prefix without repairing it (see above) |
 | `dtm.read_metadata_snapshot()` | Temperature + range + filter + `Kn` + `IG` in one call set |
 | `dtm.run_script(text)` | Execute LabVIEW-style concatenated command scripts such as `SU1IRID` |
 

@@ -24,6 +24,17 @@ def main() -> int:
     parser.add_argument("--parity", default="E", choices=["N", "E", "O"])
     parser.add_argument("--stopbits", type=float, default=2, choices=[1, 1.5, 2])
     parser.add_argument("--timeout", type=float, default=1.0, help="Read timeout in seconds")
+    parser.add_argument(
+        "--echo",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Whether commands come back before their reply — true on a G3CL "
+        "loop (fiber-optic/FTR link) or with DIP S2-4 echo ON. 'auto' "
+        "(default) probes the device and turns echo off if it finds it; "
+        "'on' declares a returning link without probing or repairing, so it "
+        "fails if the device is also echoing; 'off' declares that nothing "
+        "comes back. Use 'auto' unless you know the link state",
+    )
     args = parser.parse_args()
 
     script_text = Path(args.script).read_text(encoding="utf-8")
@@ -35,7 +46,13 @@ def main() -> int:
         stopbits=args.stopbits,
         timeout=args.timeout,
     ) as transport:
-        dtm = DTM151Serial(Group3Protocol(transport))
+        protocol = Group3Protocol(transport, expect_command_returned=args.echo == "on")
+        dtm = DTM151Serial(protocol)
+        if args.echo == "auto":
+            # identify(), not detect_command_echo(): on a loop link whose
+            # device also has S2-4 echo on, the echoed ASCII copy comes back
+            # corrupted and only identify()'s SE0 step makes the link usable.
+            dtm.identify()
         for result in dtm.run_script(script_text):
             if result.reply is None:
                 print(result.command)

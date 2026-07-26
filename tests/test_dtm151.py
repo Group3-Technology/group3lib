@@ -14,15 +14,18 @@ from group3 import (
     BaudCode,
     CommandError,
     DeviceMetadataSnapshot,
+    DeviceProfile,
     DTM151Serial,
     FakeTransport,
     FixedRangeProbeError,
     Group3Protocol,
+    InvalidCommandError,
     MeasurementMode,
     NoProbeError,
     ProtocolError,
     Unit,
 )
+from group3.protocol.parser import parse_dip_switches
 
 # ---- Golden transcripts ----
 SENT_F = b"F\r"
@@ -497,7 +500,7 @@ class TestIdentify:
         )
         profile = dtm.identify()
         assert fake.sent == [SENT_CTRL_D, SENT_CTRL_B]
-        assert profile.echo_enabled is False
+        assert profile.command_returned is False
         assert profile.baud is BaudCode.POS_E
         assert profile.dip.address == 0
         assert profile.dip.echo_enabled is False
@@ -506,7 +509,7 @@ class TestIdentify:
         assert profile.dip.data_format.data_bits == 7
         assert profile.dip.data_format.parity == "E"
         assert profile.dip.data_format.stop_bits == 2
-        assert protocol.echo_enabled is False
+        assert protocol.expect_command_returned is False
 
     def test_echo_on_auto_detected_and_coerced_off(
         self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
@@ -514,19 +517,60 @@ class TestIdentify:
         # Device echoes Ctrl-D (control byte echoed verbatim), replies;
         # echoes Ctrl-B, replies; echoes SE0 (printable body only — the
         # CR terminator is suppressed per bench observation FT572EW5),
-        # then acks with bare LF. After identify() returns, echo is off.
+        # then acks with bare LF. identify() re-probes with Ctrl-B, which
+        # now comes back unechoed, confirming echo really is off.
         fake.scripted(
             [
                 (SENT_CTRL_D, b"\x04" + DIP_REPLY_ECHO_ON),
                 (SENT_CTRL_B, b"\x02 E\r"),
                 (SENT_SE0, b"SE0\n"),  # echoed body (no CR) + bare-LF ack
+                (SENT_CTRL_B, b" E\r"),  # re-probe: no echo -> genuinely off
             ]
         )
         profile = dtm.identify()
-        assert fake.sent == [SENT_CTRL_D, SENT_CTRL_B, SENT_SE0]
-        assert profile.echo_enabled is False  # coerced off
+        assert fake.sent == [SENT_CTRL_D, SENT_CTRL_B, SENT_SE0, SENT_CTRL_B]
+        assert profile.command_returned is False  # coerced off
+        assert profile.loop_echo is False
         assert profile.dip.echo_enabled is True  # but DIP says echo on
-        assert protocol.echo_enabled is False
+        assert protocol.expect_command_returned is False
+
+    def test_g3cl_loop_ripple_survives_se0(
+        self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        """On a loop the command returns even with S2-4 off; SE0 can't stop it.
+
+        Regression for the fiber-optic/FTR failure mode: identify() used to
+        assume the SE0 ack meant silence, clear the flag, and leave every
+        later reply desynchronised by the still-arriving command prefix.
+        The loop retransmits byte-for-byte, terminator included (manual
+        §4.5.1, page 4-7).
+        """
+        fake.scripted(
+            [
+                (SENT_CTRL_D, b"\x04" + DIP_REPLY_FACTORY),  # S2-4 OFF, still returned
+                (SENT_CTRL_B, b"\x02 E\r"),
+                (SENT_SE0, b"SE0\r\n"),  # rippled verbatim (with CR) + ack
+                (SENT_CTRL_B, b"\x02 E\r"),  # re-probe: still coming back
+            ]
+        )
+        profile = dtm.identify()
+        assert fake.sent == [SENT_CTRL_D, SENT_CTRL_B, SENT_SE0, SENT_CTRL_B]
+        assert profile.dip.echo_enabled is False  # S2-4 is off...
+        assert profile.command_returned is True  # ...but commands still return
+        assert profile.loop_echo is True
+        assert protocol.expect_command_returned is True
+
+        # And the protocol is left in a state that can actually read a field.
+        fake.queue_reply(b"F\r")  # loop ripple of "F\r"
+        fake.queue_reply(b" 1.2345T\r")
+        assert dtm.read_field().value == 1.2345
+
+    def test_detect_command_echo_probes_without_identify(
+        self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        fake.scripted([(SENT_CTRL_B, b"\x02 E\r")])
+        assert dtm.detect_command_echo() is True
+        assert protocol.expect_command_returned is True
 
     def test_echo_on_left_alone_when_coerce_disabled(
         self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
@@ -539,9 +583,9 @@ class TestIdentify:
         )
         profile = dtm.identify(coerce_echo_off=False)
         assert fake.sent == [SENT_CTRL_D, SENT_CTRL_B]
-        assert profile.echo_enabled is True
+        assert profile.command_returned is True
         assert profile.baud is BaudCode.POS_F
-        assert protocol.echo_enabled is True
+        assert protocol.expect_command_returned is True
 
     def test_bench_unit_dip_reply_with_nibble_spaces_parses(
         self, dtm: DTM151Serial, fake: FakeTransport
@@ -563,7 +607,7 @@ class TestIdentify:
 
 
 class TestEchoAwareSend:
-    """Group3Protocol with echo_enabled=True must strip echoed prefix bytes."""
+    """expect_command_returned=True must strip the returned command prefix."""
 
     def test_send_with_echo_combined_buffer(
         self, fake: FakeTransport, protocol: Group3Protocol
@@ -573,7 +617,7 @@ class TestEchoAwareSend:
         Bench-verified on FT572EW5 (2026-05-09): the device echoes ``F`` (no
         ``\\r``) then immediately the reply ` 1.713G` then the terminator pair.
         """
-        protocol.echo_enabled = True
+        protocol.expect_command_returned = True
         fake.queue_reply(b"F 1.2345T\r")
         reply = protocol.send("F")
         assert reply == " 1.2345T"
@@ -581,7 +625,7 @@ class TestEchoAwareSend:
     def test_send_with_echo_missing_raises(
         self, fake: FakeTransport, protocol: Group3Protocol
     ) -> None:
-        protocol.echo_enabled = True
+        protocol.expect_command_returned = True
         fake.queue_reply(b" 1.2345T\r")  # no echoed prefix
         with pytest.raises(ProtocolError, match="echo expected"):
             protocol.send("F")
@@ -590,7 +634,7 @@ class TestEchoAwareSend:
         self, fake: FakeTransport, protocol: Group3Protocol
     ) -> None:
         """Setter with echo: echoed body + bare-LF ack arrive together."""
-        protocol.echo_enabled = True
+        protocol.expect_command_returned = True
         fake.queue_reply(b"Z\n")  # echoed body (no CR) + bare-LF ack
         protocol.send_setter("Z")
         assert fake.sent == [b"Z\r"]
@@ -598,7 +642,7 @@ class TestEchoAwareSend:
     def test_send_setter_with_echo_error_path(
         self, fake: FakeTransport, protocol: Group3Protocol
     ) -> None:
-        protocol.echo_enabled = True
+        protocol.expect_command_returned = True
         # Echoed "R2" + immediate FIXED RANGE PROBE error string.
         fake.queue_reply(b"R2 FIXED RANGE PROBE\r")
         with pytest.raises(FixedRangeProbeError):
@@ -607,7 +651,7 @@ class TestEchoAwareSend:
     def test_send_setter_with_echo_missing_raises(
         self, fake: FakeTransport, protocol: Group3Protocol
     ) -> None:
-        protocol.echo_enabled = True
+        protocol.expect_command_returned = True
         fake.queue_reply(b" surprise\r")
         with pytest.raises(ProtocolError, match="echo expected"):
             protocol.send_setter("Z")
@@ -624,7 +668,7 @@ class TestEchoAwareSend:
         overflow) caused the echo-validation path to abort before the
         residue could be absorbed.
         """
-        protocol.echo_enabled = True
+        protocol.expect_command_returned = True
         fake.queue_reply(b"\r")  # leftover terminator residue
         fake.queue_reply(b"F 1.2345T\r")  # real echo + reply
         assert protocol.send("F") == " 1.2345T"
@@ -636,10 +680,298 @@ class TestEchoAwareSend:
         stripped from the same read buffer rather than failing the echo
         check.
         """
-        protocol.echo_enabled = True
+        protocol.expect_command_returned = True
         fake.queue_reply(b"\rZ\n")  # residue + echoed body + bare-LF ack
         protocol.send_setter("Z")
         assert fake.sent == [b"Z\r"]
+
+
+class _DrainAfterWrite(FakeTransport):
+    """FakeTransport whose drain bytes only appear after a specific write.
+
+    ``FakeTransport.read_optional`` serves the shared reply queue immediately,
+    so bytes meant for a *later* drain get eaten by an earlier one. This models
+    the wire instead: nothing to drain until the triggering command goes out.
+    """
+
+    def __init__(self, trigger: bytes, drain: bytes) -> None:
+        super().__init__()
+        self._trigger = trigger
+        self._drain = drain
+        self._armed = False
+
+    def write_only(self, payload: bytes) -> None:
+        super().write_only(payload)
+        if payload == self._trigger:
+            self._armed = True
+
+    def read_optional(self, timeout: float) -> bytes:
+        if self._armed:
+            self._armed = False
+            return self._drain
+        return super().read_optional(timeout)
+
+
+class TestDoubleReturnedCommand:
+    """S2-4 echo *and* a G3CL loop: the command comes back twice.
+
+    Manual §3.6 (page 3-11): "If echo is ON in the latter case, the
+    teslameter will transmit each input command twice, first the original
+    command rippling through, then the echoed command." The loop copy is
+    byte-for-byte (terminator included); the echoed copy has its terminator
+    suppressed.
+    """
+
+    def test_send_split_frames(
+        self, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        """Ripple terminates the first frame; the echoed copy leads the next."""
+        protocol.expect_command_returned = True
+        fake.queue_reply(b"F\r")  # loop ripple, with terminator
+        fake.queue_reply(b"F 1.2345T\r")  # S2-4 echo + reply
+        assert protocol.send("F") == " 1.2345T"
+
+    def test_send_combined_frame(
+        self, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        """Both copies and the reply in one frame."""
+        protocol.expect_command_returned = True
+        fake.queue_reply(b"F\rF 1.2345T\r")
+        assert protocol.send("F") == " 1.2345T"
+
+    def test_send_both_copies_alone_then_reply(
+        self, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        protocol.expect_command_returned = True
+        fake.queue_reply(b"F\r")
+        fake.queue_reply(b"F")
+        fake.queue_reply(b" 1.2345T\r")
+        assert protocol.send("F") == " 1.2345T"
+
+    def test_send_control_combined_frame(
+        self, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        """Control bytes carry no terminator, so both copies share a frame.
+
+        This is what identify() hits first: a double-returned Ctrl-D used to
+        leave the second ``\\x04`` glued to the DIP reply, so parsing failed
+        before SE0 could be issued.
+        """
+        fake.scripted([(b"\x04", b"\x04\x04 0110001100000000\r")])
+        assert protocol.send_control(b"\x04") == " 0110001100000000"
+        assert protocol.expect_command_returned is True
+
+    def test_send_control_split_frames(
+        self, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        fake.queue_reply(b"\x04")
+        fake.queue_reply(b"\x04")
+        fake.queue_reply(b" 0110001100000000\r")
+        assert protocol.send_control(b"\x04") == " 0110001100000000"
+        assert protocol.expect_command_returned is True
+
+    def test_send_setter_combined_frame(
+        self, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        protocol.expect_command_returned = True
+        fake.queue_reply(b"Z\rZ\n")  # ripple + echoed body + bare-LF ack
+        protocol.send_setter("Z")
+        assert fake.sent == [b"Z\r"]
+
+    def test_send_setter_split_frames_error_path(
+        self, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        """A §4.5.3 error behind two returned copies still raises."""
+        protocol.expect_command_returned = True
+        fake.queue_reply(b"R2\r")
+        fake.queue_reply(b"R2 FIXED RANGE PROBE\r")
+        with pytest.raises(FixedRangeProbeError):
+            protocol.send_setter("R2")
+
+    @staticmethod
+    def _identify_with_se0_drain(drain: bytes) -> tuple[DTM151Serial, _DrainAfterWrite]:
+        """Wire up an identify() run whose SE0 drain yields ``drain``.
+
+        ``identify()`` opens with ``drain_pending()``, so bytes queued
+        up-front would be swallowed there — the transport must withhold them
+        until SE0 is actually written, the way real hardware does.
+        """
+        transport = _DrainAfterWrite(trigger=SENT_SE0, drain=drain)
+        transport.open()
+        transport.scripted(
+            [
+                (SENT_CTRL_D, b"\x04\x04" + DIP_REPLY_FACTORY),
+                (SENT_CTRL_B, b"\x02\x02 E\r"),
+                (SENT_SE0, b""),  # write-only; the drain supplies the bytes
+                (SENT_CTRL_B, b"\x02 E\r"),  # re-probe: loop copy only
+            ]
+        )
+        return DTM151Serial(Group3Protocol(transport)), transport
+
+    def test_identify_recovers_when_the_SE0_echo_is_corrupted(self) -> None:
+        """Echo-on-over-loop corrupts the echoed ASCII copy; recovery must survive it.
+
+        Bench-observed on an FTR loop with echo ON (2026-07-26): control
+        bytes come back cleanly twice, but the echoed copy of an ASCII
+        command is mangled — ``SE0`` returned as ``b'S\\x05`\\x000'``. The
+        coercion step must not require a clean echo of the very command
+        that repairs the link.
+        """
+        dtm, transport = self._identify_with_se0_drain(b"S\x05`\x000\n")
+        profile = dtm.identify()
+        assert transport.sent == [SENT_CTRL_D, SENT_CTRL_B, SENT_SE0, SENT_CTRL_B]
+        assert profile.command_returned is True
+        assert profile.loop_echo is True
+
+    def test_identify_still_raises_if_SE0_is_rejected(self) -> None:
+        """Tolerating corruption must not swallow a genuine device error."""
+        dtm, _ = self._identify_with_se0_drain(b" INVALID COMMAND ENTRY\r")
+        with pytest.raises(InvalidCommandError):
+            dtm.identify()
+
+    def test_recovery_SE0_does_not_leak_into_a_later_last_raw_tx(self) -> None:
+        """The repair is a complete exchange, not a pending write.
+
+        ``send_no_reply`` would leave ``SE0\\r`` in the pending-TX buffer, so
+        the *next* command's ``last_raw_tx`` would claim to have sent it
+        again. ``send_unvalidated`` finalises the exchange instead.
+        """
+        dtm, transport = self._identify_with_se0_drain(b"S\x05`\x000\n")
+        protocol = dtm._protocol
+        assert isinstance(protocol, Group3Protocol)
+        dtm.identify()
+        assert protocol.last_raw_tx == SENT_CTRL_B  # the re-probe, not SE0
+
+        transport.queue_reply(b"F\r")
+        transport.queue_reply(b" 1.2345T\r")
+        dtm.read_field()
+        assert protocol.last_raw_tx == SENT_F  # no SE0 prefix
+
+    def test_send_unvalidated_returns_drained_bytes_and_finalises(
+        self, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        """It owns the pending write-only bytes, then hands nothing forward."""
+        protocol.send_no_reply("A5")  # e.g. a G3CL address prefix, left pending
+        fake.queue_reply(b"S\x05`\x000\n")
+        assert protocol.send_unvalidated("SE0") == b"S\x05`\x000\n"
+        assert protocol.last_raw_tx == b"A5\r" + SENT_SE0  # this exchange owns both
+        fake.queue_reply(b" 1.2345T\r")
+        protocol.send("F")
+        assert protocol.last_raw_tx == SENT_F  # nothing inherited
+
+    def test_identify_on_loop_with_S2_4_echo_on(
+        self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        """End to end: identify() survives the double return and coerces echo off.
+
+        After SE0 the device stops echoing but the loop keeps rippling, so
+        one copy remains — reported as loop_echo.
+        """
+        fake.scripted(
+            [
+                (SENT_CTRL_D, b"\x04\x04" + DIP_REPLY_ECHO_ON),
+                (SENT_CTRL_B, b"\x02\x02 E\r"),
+                (SENT_SE0, b"SE0\rSE0\n"),  # ripple + echo + ack
+                (SENT_CTRL_B, b"\x02 E\r"),  # re-probe: loop copy only
+            ]
+        )
+        profile = dtm.identify()
+        assert profile.dip.echo_enabled is True  # S2-4 was on...
+        assert profile.command_returned is True  # ...loop still returns
+        assert profile.loop_echo is True
+        assert protocol.expect_command_returned is True
+
+        fake.queue_reply(b"F\r")
+        fake.queue_reply(b" 1.2345T\r")
+        assert dtm.read_field().value == 1.2345
+
+
+class TestUnexpectedCommandReturned:
+    """A returned command with the flag off must name its own cause.
+
+    Symptom the diagnostic replaces: an FTR fiber-optic link puts the host on
+    a G3CL loop, ``F`` ripples back, and the failure surfaces in the parser as
+    "expected numeric field reply, got 'F'" — three layers from the cause.
+    """
+
+    def test_send_reply_is_the_command(
+        self, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        fake.queue_reply(b"F\r")  # loop ripple, terminator included
+        with pytest.raises(ProtocolError) as excinfo:
+            protocol.send("F")
+        message = str(excinfo.value)
+        assert "returned verbatim" in message
+        assert "G3CL" in message
+        assert "expect_command_returned=True" in message
+        assert excinfo.value.raw == b"F\r"
+
+    def test_send_setter_reply_is_the_command(
+        self, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        fake.queue_reply(b"Z\r")
+        with pytest.raises(ProtocolError, match="returned verbatim"):
+            protocol.send_setter("Z")
+
+    def test_genuine_error_string_still_wins(
+        self, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        """The diagnostic must not shadow a §4.5.3 device error."""
+        fake.queue_reply(b" NO PROBE\r")
+        with pytest.raises(NoProbeError):
+            protocol.send("F")
+
+
+class TestDeprecatedEchoAlias:
+    def test_protocol_kwarg_alias(self, fake: FakeTransport) -> None:
+        with pytest.warns(DeprecationWarning, match="expect_command_returned"):
+            protocol = Group3Protocol(fake, echo_enabled=True)
+        assert protocol.expect_command_returned is True
+
+    def test_protocol_attribute_alias(self, protocol: Group3Protocol) -> None:
+        protocol.expect_command_returned = True
+        with pytest.warns(DeprecationWarning):
+            assert protocol.echo_enabled is True
+        with pytest.warns(DeprecationWarning):
+            protocol.echo_enabled = False
+        assert protocol.expect_command_returned is False
+
+    def test_profile_constructor_alias(self) -> None:
+        """DeviceProfile(echo_enabled=...) must still construct, not TypeError."""
+        dip = parse_dip_switches(" 0110001100000000")
+        with pytest.warns(DeprecationWarning, match="command_returned"):
+            profile = DeviceProfile(dip=dip, baud=BaudCode.POS_E, echo_enabled=True)
+        assert profile.command_returned is True
+        assert profile.loop_echo is False
+
+    def test_profile_constructor_current_name_is_silent(self) -> None:
+        dip = parse_dip_switches(" 0110001100000000")
+        profile = DeviceProfile(dip=dip, baud=BaudCode.POS_E, command_returned=True)
+        assert profile.command_returned is True
+
+    def test_profile_constructor_requires_a_value(self) -> None:
+        dip = parse_dip_switches(" 0110001100000000")
+        with pytest.raises(TypeError, match="command_returned"):
+            DeviceProfile(dip=dip, baud=BaudCode.POS_E)
+
+    def test_profile_stays_frozen(self) -> None:
+        dip = parse_dip_switches(" 0110001100000000")
+        profile = DeviceProfile(dip=dip, baud=BaudCode.POS_E, command_returned=False)
+        with pytest.raises(AttributeError):
+            profile.command_returned = True  # type: ignore[misc]
+
+    def test_profile_attribute_alias(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.scripted(
+            [
+                (SENT_CTRL_D, DIP_REPLY_FACTORY),
+                (SENT_CTRL_B, b" E\r"),
+            ]
+        )
+        profile = dtm.identify()
+        with pytest.warns(DeprecationWarning, match="command_returned"):
+            assert profile.echo_enabled is False
 
 
 class TestSendControl:
@@ -649,7 +981,7 @@ class TestSendControl:
         fake.scripted([(b"\x04", b" 0110001100000000\r")])
         reply = protocol.send_control(b"\x04")
         assert reply == " 0110001100000000"
-        assert protocol.echo_enabled is False
+        assert protocol.expect_command_returned is False
 
     def test_auto_detect_echo_on(
         self, fake: FakeTransport, protocol: Group3Protocol
@@ -658,7 +990,7 @@ class TestSendControl:
         fake.scripted([(b"\x04", b"\x04 0110001100000000\r")])
         reply = protocol.send_control(b"\x04")
         assert reply == " 0110001100000000"
-        assert protocol.echo_enabled is True
+        assert protocol.expect_command_returned is True
 
     def test_auto_detect_echo_on_two_frames(
         self, fake: FakeTransport, protocol: Group3Protocol
@@ -668,7 +1000,7 @@ class TestSendControl:
         fake.queue_reply(b" 0110001100000000\r")
         reply = protocol.send_control(b"\x04")
         assert reply == " 0110001100000000"
-        assert protocol.echo_enabled is True
+        assert protocol.expect_command_returned is True
 
     def test_expect_echo_true_strict(
         self, fake: FakeTransport, protocol: Group3Protocol
@@ -821,21 +1153,21 @@ class TestDisplayUnitsAndEcho:
     def test_set_echo_on_updates_protocol_flag(
         self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
     ) -> None:
-        assert protocol.echo_enabled is False
+        assert protocol.expect_command_returned is False
         dtm.set_echo(True)
         assert fake.sent == [SENT_SE1_BARE]
-        assert protocol.echo_enabled is True
+        assert protocol.expect_command_returned is True
 
     def test_set_echo_off_updates_protocol_flag(
         self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
     ) -> None:
-        protocol.echo_enabled = True
+        protocol.expect_command_returned = True
         # With echo currently on, we need a scripted reply that includes
         # the echoed body before the ack.
         fake.queue_reply(b"SE0\n")
         dtm.set_echo(False)
         assert fake.sent == [SENT_SE0_BARE]
-        assert protocol.echo_enabled is False
+        assert protocol.expect_command_returned is False
 
 
 class TestRestartAndReset:
@@ -849,7 +1181,7 @@ class TestRestartAndReset:
     def test_restart_with_echo_on(
         self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
     ) -> None:
-        protocol.echo_enabled = True
+        protocol.expect_command_returned = True
         fake.scripted([(SENT_CTRL_U, b"\x15 GROUP3 DTMS 7.10\r")])
         banner = dtm.restart()
         assert banner == " GROUP3 DTMS 7.10"

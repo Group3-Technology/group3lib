@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import Literal
@@ -214,16 +215,74 @@ class BaudCode(IntEnum):
     POS_F = 19200
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class DeviceProfile:
     """Snapshot of a DTM-151-S's connect-time identification.
 
     Returned by :meth:`group3.DTM151Serial.identify`. Captures the DIP-switch
-    state, the baud-rate switch position, and the live echo state (which may
-    have been mutated by ``SEn`` after boot, so it is not necessarily
-    ``dip.echo_enabled``).
+    state, the baud-rate switch position, and whether commands come back on
+    the wire ahead of their replies.
+
+    The S2-4 echo setting the device booted with is ``dip.echo_enabled``;
+    :attr:`command_returned` is the *observed* live state, which can differ
+    because ``SEn`` may have changed it since boot, or because the link is a
+    G3CL loop (see :attr:`loop_echo`).
     """
 
     dip: DipSwitches
     baud: BaudCode
-    echo_enabled: bool
+    #: ``True`` if each command is returned before its reply — the state the
+    #: protocol is now configured for.
+    command_returned: bool
+    #: ``True`` if commands still come back after ``SE0`` was accepted, which
+    #: means the return is the G3CL loop rippling the message around back to
+    #: the host (manual §4.5.1, page 4-7), not the device's S2-4 echo. Only
+    #: meaningful when :meth:`~group3.DTM151Serial.identify` was allowed to
+    #: coerce echo off; ``False`` otherwise.
+    loop_echo: bool = False
+
+    def __init__(
+        self,
+        dip: DipSwitches,
+        baud: BaudCode,
+        command_returned: bool | None = None,
+        loop_echo: bool = False,
+        echo_enabled: bool | None = None,
+    ) -> None:
+        """Construct a profile.
+
+        ``echo_enabled`` is accepted as a deprecated alias for
+        ``command_returned`` so callers written against the old field name
+        keep working — hand-written init rather than the generated one
+        purely to preserve that.
+        """
+        if echo_enabled is not None:
+            warnings.warn(
+                "DeviceProfile(echo_enabled=...) is deprecated; use "
+                "command_returned=... — a G3CL loop returns commands even "
+                "with echo (S2-4) off.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if command_returned is None:
+                command_returned = echo_enabled
+        if command_returned is None:
+            raise TypeError(
+                "DeviceProfile requires 'command_returned' (or the deprecated "
+                "'echo_enabled')"
+            )
+        object.__setattr__(self, "dip", dip)
+        object.__setattr__(self, "baud", baud)
+        object.__setattr__(self, "command_returned", command_returned)
+        object.__setattr__(self, "loop_echo", loop_echo)
+
+    @property
+    def echo_enabled(self) -> bool:
+        """Deprecated alias for :attr:`command_returned`."""
+        warnings.warn(
+            "DeviceProfile.echo_enabled is deprecated; use command_returned "
+            "(or dip.echo_enabled for the S2-4 switch itself).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.command_returned

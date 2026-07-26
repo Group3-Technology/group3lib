@@ -23,6 +23,7 @@ from collections.abc import Iterable
 
 from group3 import (
     DeviceError,
+    DTM151Serial,
     Group3Protocol,
     ProtocolError,
     SerialTransport,
@@ -97,6 +98,17 @@ def main() -> None:
         help="Seconds to wait for a setter reply (default 0.2 = 200 ms)",
     )
     parser.add_argument("--timeout", type=float, default=1.0)
+    parser.add_argument(
+        "--echo",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Whether commands come back before their reply — true on a G3CL "
+        "loop (fiber-optic/FTR link) or with DIP S2-4 echo ON. 'auto' "
+        "(default) probes the device and turns echo off if it finds it; "
+        "'on' declares a returning link without probing or repairing, so it "
+        "fails if the device is also echoing; 'off' declares that nothing "
+        "comes back. Use 'auto' unless you know the link state",
+    )
     args = parser.parse_args()
 
     transport = SerialTransport(
@@ -108,7 +120,11 @@ def main() -> None:
         timeout=args.timeout,
     )
     with transport as t:
-        protocol = Group3Protocol(t)
+        protocol = Group3Protocol(t, expect_command_returned=args.echo == "on")
+        if args.echo == "auto":
+            # The probe itself lives on the model layer; this script drives
+            # the protocol directly, so borrow it for the one call.
+            DTM151Serial(protocol).identify()
         _probe(protocol, _safe_setters(), error_window=args.error_window)
 
 

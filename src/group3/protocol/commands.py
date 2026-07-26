@@ -212,7 +212,8 @@ def se_set_echo(enabled: bool) -> str:
 
     With echo ON the device echoes every command byte before transmitting the
     reply. The protocol layer strips this prefix when
-    :attr:`group3.protocol.core.Group3Protocol.echo_enabled` is ``True``.
+    :attr:`group3.protocol.core.Group3Protocol.expect_command_returned`
+    is ``True``.
 
     Args:
         enabled: ``True`` selects ``SE1`` (echo ON), ``False`` selects ``SE0``

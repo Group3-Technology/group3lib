@@ -16,6 +16,7 @@ tests and users can inspect them for debugging.
 from __future__ import annotations
 
 import time
+import warnings
 from dataclasses import dataclass
 
 from group3.exceptions import ProtocolError
@@ -32,17 +33,68 @@ class _LastExchange:
 
 
 def _echo_prefix(payload: bytes, terminator: bytes) -> bytes:
-    """Return the bytes of ``payload`` the device echoes when echo is ON.
+    """Return the bytes of ``payload`` that come back before the reply.
 
-    Verified on bench unit FT572EW5 (2026-05-09): the firmware echoes the
-    printable command body but suppresses the host-side CR terminator that
-    triggered command processing. Control-character commands (no terminator)
-    are echoed verbatim. So the echo prefix is the payload with its trailing
-    terminator (if any) stripped.
+    Two unrelated mechanisms put the command back on the wire ahead of its
+    reply (see :attr:`Group3Protocol.expect_command_returned`), and the
+    prefix differs slightly between them:
+
+    * **S2-4 echo.** Verified on bench unit FT572EW5 (2026-05-09): the
+      firmware echoes the printable command body but suppresses the
+      host-side CR terminator that triggered command processing.
+    * **G3CL loop ripple.** The command is retransmitted around the loop
+      byte-for-byte, terminator included (manual §4.5.1, page 4-7).
+
+    Stripping the terminator covers both: the ripple's trailing terminator
+    is then handled as ordinary residue by the callers.
     """
     if terminator and payload.endswith(terminator):
         return payload[: -len(terminator)]
     return payload
+
+
+def _strip_returned_commands(raw: bytes, echo_prefix: bytes, terminator: bytes) -> bytes:
+    """Strip every copy of the returned command from the front of ``raw``.
+
+    A command can come back **twice**: manual §3.6 (page 3-11) states that
+    with S2-4 echo ON *and* the G3CL ports in use, "the teslameter will
+    transmit each input command twice, first the original command rippling
+    through, then the echoed command". Stripping a single prefix leaves the
+    second copy glued to the reply.
+
+    Greedy stripping is safe because every genuine reply starts with a space
+    (manual §4.5.2), so no reply can be mistaken for another returned copy.
+    Each copy may or may not carry the terminator with it — the loop ripple
+    is byte-for-byte and does, the S2-4 echo suppresses it — so a terminator
+    between copies is consumed too.
+    """
+    if not echo_prefix:
+        return raw
+    while raw.startswith(echo_prefix):
+        raw = raw[len(echo_prefix):]
+        if terminator and raw.startswith(terminator):
+            raw = raw[len(terminator):]
+    return raw
+
+
+def _command_returned_error(command: str, raw: bytes) -> ProtocolError:
+    """Build the diagnostic raised when a reply is just the command, returned.
+
+    This is the signature failure of talking to a device whose command comes
+    back before its reply while the protocol is not expecting it. Without a
+    named diagnostic the symptom surfaces two layers away, in the parser, as
+    an opaque "expected numeric field reply, got 'F'".
+    """
+    return ProtocolError(
+        f"reply is {command!r} — the command just sent, returned verbatim. "
+        f"Either the device has echo ON (DIP S2-4, manual §3.6 page 3-11) or "
+        f"the host sits on a G3CL loop, where every command ripples back "
+        f"before its reply regardless of S2-4 (manual §4.5.1 page 4-7 — this "
+        f"is the normal case for a fiber-optic/FTR link). Construct "
+        f"Group3Protocol(..., expect_command_returned=True), or call "
+        f"DTM151Serial.identify() / detect_command_echo() to probe for it.",
+        raw=raw,
+    )
 
 
 # Default window to wait after a setter for either a bare-terminator ack
@@ -62,7 +114,8 @@ class Group3Protocol:
         transport: Transport,
         terminator: bytes = codec.CR,
         timeout: float | None = None,
-        echo_enabled: bool = False,
+        expect_command_returned: bool = False,
+        echo_enabled: bool | None = None,
     ) -> None:
         """
         Args:
@@ -71,21 +124,66 @@ class Group3Protocol:
                 requires CR on the host→device direction (manual section 4.5.2).
             timeout: Default per-request timeout in seconds. ``None`` means "use the
                 transport's default".
-            echo_enabled: ``True`` if the device is configured (via DIP S2-4 or the
-                ``SE1`` command) to echo every command byte before its reply. The
-                normal flow is to leave this ``False`` and call
-                :meth:`group3.DTM151Serial.identify` after connect, which auto-detects
-                the device's echo state and (by default) coerces it off via ``SE0``.
+            expect_command_returned: ``True`` if each command comes back on the
+                wire before its reply — see
+                :attr:`expect_command_returned`. The normal flow is to leave
+                this ``False`` and call :meth:`group3.DTM151Serial.identify`
+                after connect, which probes for it.
+            echo_enabled: Deprecated alias for ``expect_command_returned``. The
+                old name described only one of the two causes.
         """
         self.transport = transport
         self.terminator = terminator
         self.timeout = timeout
-        self.echo_enabled = echo_enabled
+        if echo_enabled is not None:
+            warnings.warn(
+                "Group3Protocol(echo_enabled=...) is deprecated; use "
+                "expect_command_returned=... — a G3CL loop returns commands "
+                "even with echo (S2-4) off.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            expect_command_returned = echo_enabled
+        #: ``True`` when the command sent is returned ahead of its reply. Two
+        #: unrelated causes produce this, and the wire looks the same either
+        #: way, so one flag covers both:
+        #:
+        #: * the device echoes commands — DIP S2-4 ON or the ``SE1`` command
+        #:   (manual §3.6, page 3-11). Clearable with ``SE0``.
+        #: * the host is on a Group3 Communication Loop, where each device
+        #:   retransmits the message on around the loop until it arrives back
+        #:   at the host (manual §4.5.1, page 4-7). This is topology, **not** a
+        #:   setting: ``SE0`` cannot switch it off, and with S2-4 also ON the
+        #:   command comes back twice.
+        self.expect_command_returned = expect_command_returned
         self._last = _LastExchange()
         # Accumulates write_only payloads (e.g., G3CL ``An`` prefixes) so that
         # ``last_raw_tx`` after a subsequent ``send`` reflects everything that
         # went on the wire since the previous reply, not just the final command.
         self._pending_tx = bytearray()
+
+    @property
+    def echo_enabled(self) -> bool:
+        """Deprecated alias for :attr:`expect_command_returned`."""
+        warnings.warn(
+            "Group3Protocol.echo_enabled is deprecated; use "
+            "expect_command_returned — a G3CL loop returns commands even with "
+            "echo (S2-4) off.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.expect_command_returned
+
+    @echo_enabled.setter
+    def echo_enabled(self, value: bool) -> None:
+        warnings.warn(
+            "Group3Protocol.echo_enabled is deprecated; use "
+            "expect_command_returned — a G3CL loop returns commands even with "
+            "echo (S2-4) off.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.expect_command_returned = value
 
     # ------------------------------------------------------------------
     # send helpers
@@ -177,31 +275,39 @@ class Group3Protocol:
 
         raw = _drain_residue(raw)
 
-        if self.echo_enabled:
-            # With echo ON the device echoes the printable bytes of the
-            # command (without its trailing terminator — verified on bench
-            # unit FT572EW5 on 2026-05-09). The terminator is consumed by
-            # the firmware's command parser and not echoed back.
+        if self.expect_command_returned:
+            # The command comes back ahead of its reply — echoed by the device
+            # (printable body only, terminator suppressed; verified on bench
+            # unit FT572EW5 on 2026-05-09) or rippled around the G3CL loop
+            # (byte-for-byte, terminator included).
             echo_prefix = _echo_prefix(payload, self.terminator)
             if not raw.startswith(echo_prefix):
                 raise ProtocolError(
-                    f"echo expected (echo_enabled=True) but reply for "
-                    f"{command!r} does not start with the echoed payload",
+                    f"command echo expected (expect_command_returned=True) but "
+                    f"reply for {command!r} does not start with the echoed payload",
                     raw=bytes(accumulated_rx),
                 )
-            raw = raw[len(echo_prefix):]
-            if not raw or raw == self.terminator:
-                # Echo arrived alone (or with only its own terminator) —
-                # read the actual reply.
+            raw = _strip_returned_commands(raw, echo_prefix, self.terminator)
+            while not raw or codec.strip_terminators(codec.decode(raw)) == "":
+                # Only returned copies (and their terminators) so far — read
+                # on for the reply. A second copy may lead the next frame,
+                # since the transport breaks frames at the terminator the
+                # loop ripple carries.
                 remaining = _remaining()
                 raw = self.transport.read_reply(
                     remaining if remaining is not None else 1.0
                 )
                 accumulated_rx.extend(raw)
                 self._last = _LastExchange(tx=full_tx, rx=bytes(accumulated_rx))
-                raw = _drain_residue(raw)
+                raw = _strip_returned_commands(raw, echo_prefix, self.terminator)
 
         reply = codec.strip_terminators(codec.decode(raw))
+        if not self.expect_command_returned and reply == command:
+            # Every genuine reply starts with a space (manual §4.5.2), so a
+            # reply identical to the command can only be the command coming
+            # back at us. Name the cause here rather than letting the parser
+            # fail on it downstream.
+            raise _command_returned_error(command, bytes(accumulated_rx))
         check_error(reply)
         return reply
 
@@ -261,7 +367,7 @@ class Group3Protocol:
             leading += 1
         raw = raw[leading:]
 
-        if self.echo_enabled and echo_command is not None and raw:
+        if self.expect_command_returned and echo_command is not None and raw:
             # The caller just wrote ``echo_command`` via send_no_reply; the
             # device echoed its printable body (terminator suppressed —
             # verified on bench unit FT572EW5). Strip that echo before
@@ -274,14 +380,17 @@ class Group3Protocol:
                     "but drained bytes do not start with the echoed payload",
                     raw=bytes(accumulated),
                 )
-            raw = raw[len(echo_prefix):]
-            if not raw:
-                # Echo arrived alone — read the actual ack within the window.
+            raw = _strip_returned_commands(raw, echo_prefix, self.terminator)
+            while not raw:
+                # Only returned copies so far — read on for the actual ack
+                # within the window. A second copy (S2-4 echo behind the
+                # loop ripple) may lead the next frame.
                 tail = self.transport.read_optional(window)
-                if tail:
-                    accumulated.extend(tail)
-                    self._last = _LastExchange(tx=self._last.tx, rx=bytes(accumulated))
-                    raw = tail
+                if not tail:
+                    break
+                accumulated.extend(tail)
+                self._last = _LastExchange(tx=self._last.tx, rx=bytes(accumulated))
+                raw = _strip_returned_commands(tail, echo_prefix, self.terminator)
 
         reply = codec.strip_terminators(codec.decode(raw))
         if reply == "":
@@ -291,6 +400,49 @@ class Group3Protocol:
             f"Unexpected reply during ack drain: {reply!r}",
             raw=bytes(accumulated),
         )
+
+    def send_unvalidated(
+        self, command: str, window: float = DEFAULT_SETTER_ERROR_WINDOW
+    ) -> bytes:
+        """Write ``command``, absorb everything it produces, and return those bytes.
+
+        A deliberate escape hatch from the usual guarantees, for **repair**
+        paths only: no echo-prefix validation, no error checking, no reply
+        parsing. It exists because those checks assume a healthy link, and a
+        repair runs precisely when the link is not healthy — bench-observed
+        on an FTR loop with echo ON (2026-07-26), where the device's echoed
+        copy of ``SE0`` came back corrupted as ``b'S\\x05`\\x000'`` and a
+        strict check would have aborted the one command that fixes the link.
+
+        The caller decides what the drained bytes mean — typically running
+        :func:`~group3.protocol.parser.check_error` over a lenient decode to
+        catch an outright rejection while tolerating corruption.
+
+        Unlike :meth:`send_no_reply`, this finalises the exchange: the
+        pending-TX buffer is cleared so the command does not reappear in a
+        later :attr:`last_raw_tx`.
+
+        Args:
+            command: Command string, without terminator.
+            window: Per-read wait while draining. Draining stops at the first
+                empty read.
+
+        Returns:
+            Every byte drained, concatenated, exactly as it arrived.
+        """
+        payload = codec.encode(command, self.terminator)
+        full_tx = bytes(self._pending_tx) + payload
+        self.transport.write_only(payload)
+        # This *is* the whole exchange — nothing later should inherit it.
+        self._pending_tx.clear()
+        drained = bytearray()
+        while True:
+            chunk = self.transport.read_optional(window)
+            if not chunk:
+                break
+            drained.extend(chunk)
+        self._last = _LastExchange(tx=full_tx, rx=bytes(drained))
+        return bytes(drained)
 
     def drain_pending(self, window: float = 0.05) -> list[bytes]:
         """Drain any in-flight replies from the transport.
@@ -434,25 +586,26 @@ class Group3Protocol:
             leading += 1
         raw = raw[leading:]
 
-        if self.echo_enabled and raw:
-            # With echo ON the device echoes the printable command body
-            # (terminator suppressed — see _echo_prefix). Strip the echo,
-            # then read again for the actual ack/error if it didn't arrive
-            # in the same buffer.
+        if self.expect_command_returned and raw:
+            # The command comes back ahead of the ack (device echo, or G3CL
+            # ripple — see _echo_prefix). Strip it, then read again for the
+            # actual ack/error if it didn't arrive in the same buffer.
             echo_prefix = _echo_prefix(payload, self.terminator)
             if not raw.startswith(echo_prefix):
                 self._pending_tx.clear()
                 self._last = _LastExchange(tx=full_tx, rx=bytes(accumulated_rx))
                 raise ProtocolError(
-                    f"echo expected for setter {command!r} but reply does "
-                    f"not start with the echoed payload",
+                    f"command echo expected for setter {command!r} but reply "
+                    f"does not start with the echoed payload",
                     raw=bytes(accumulated_rx),
                 )
-            raw = raw[len(echo_prefix):]
-            if not raw:
+            raw = _strip_returned_commands(raw, echo_prefix, self.terminator)
+            while not raw:
                 tail = self.transport.read_optional(error_window)
+                if not tail:
+                    break
                 accumulated_rx.extend(tail)
-                raw = tail
+                raw = _strip_returned_commands(tail, echo_prefix, self.terminator)
 
         if raw:
             # The device sent something — either a bare terminator ack
@@ -467,6 +620,8 @@ class Group3Protocol:
                 # Terminator-only frame carries no payload — manual §4.5.2
                 # treats setters as silent on success, so accept this as success.
                 return
+            if not self.expect_command_returned and reply == command:
+                raise _command_returned_error(command, bytes(accumulated_rx))
             check_error(reply)
             # check_error didn't raise — this was an unrecognised reply to a
             # silent-success command, which means we're desynchronised.
@@ -498,9 +653,10 @@ class Group3Protocol:
             payload: The control bytes (typically a single byte). Sent verbatim.
             expect_echo: ``True`` to require an echoed prefix, ``False`` to require
                 no echo, or ``None`` (default) to auto-detect from the reply prefix.
-                When ``None`` the protocol's :attr:`echo_enabled` flag is updated
-                from the detection result — useful as the very first probe at
-                connect time when the device's echo state is not yet known.
+                When ``None`` the protocol's :attr:`expect_command_returned` flag
+                is updated from the detection result — useful as the very first
+                probe at connect time, when it is not yet known whether the wire
+                returns commands.
             timeout: Per-call timeout. ``None`` uses :attr:`timeout`.
 
         Returns:
@@ -540,7 +696,7 @@ class Group3Protocol:
             echo_present = False
         else:
             echo_present = raw.startswith(echo_prefix)
-            self.echo_enabled = echo_present
+            self.expect_command_returned = echo_present
 
         if expect_echo is True and not echo_present:
             raise ProtocolError(
@@ -550,16 +706,19 @@ class Group3Protocol:
             )
 
         if echo_present:
-            raw = raw[len(echo_prefix):]
-            if not raw:
-                # Echo arrived alone — read the actual reply.
+            # A control byte has no terminator, so a double return (S2-4 echo
+            # on top of the G3CL ripple — manual §3.6, page 3-11) arrives as
+            # two adjacent copies in the same frame. Strip every copy, then
+            # read on if that consumed the whole frame.
+            raw = _strip_returned_commands(raw, echo_prefix, self.terminator)
+            while not raw:
                 remaining = _remaining()
                 next_raw = self.transport.read_reply(
                     remaining if remaining is not None else 1.0
                 )
                 accumulated_rx.extend(next_raw)
                 self._last = _LastExchange(tx=payload, rx=bytes(accumulated_rx))
-                raw = next_raw
+                raw = _strip_returned_commands(next_raw, echo_prefix, self.terminator)
 
         reply = codec.strip_terminators(codec.decode(raw))
         check_error(reply)
