@@ -105,7 +105,7 @@ class AddressedProtocol:
         self._inner.send_no_reply(addr_command)
         self._inner.drain_setter_ack(echo_command=addr_command)
         self._inner.send_no_reply(command)
-        if self._inner.echo_enabled:
+        if self._inner.expect_command_returned:
             self._inner.drain_setter_ack(echo_command=command)
 
     # Deliberately no ``read_next`` / ``drain_pending`` here.

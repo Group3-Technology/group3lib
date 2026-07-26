@@ -190,7 +190,7 @@ class TestAddressedProtocol:
         by ``drain_setter_ack`` rather than treated as an unexpected reply.
 
         Pre-fix, ``drain_setter_ack`` was not echo-aware: after ``set_echo(True)``
-        the inner protocol's ``echo_enabled`` flag was set, but the addressed
+        the inner protocol's ``expect_command_returned`` flag was set, but the addressed
         send-path drained ``A5`` (the echoed prefix body, terminator suppressed
         per bench observation) and raised ``ProtocolError`` because the echo
         bytes don't strip to an empty reply.
@@ -201,7 +201,7 @@ class TestAddressedProtocol:
         # bare-LF ack; F: device echoes "F" plus the real reply.
         fake.queue_reply(b"A5\n")
         fake.queue_reply(b"F 1.2T\r")
-        protocol = Group3Protocol(fake, echo_enabled=True)
+        protocol = Group3Protocol(fake, expect_command_returned=True)
         session = G3CLSession(protocol)
         assert session.select(5).send("F") == " 1.2T"
         assert fake.sent == [SENT_A5, SENT_F]
@@ -214,7 +214,7 @@ class TestAddressedProtocol:
         fake = FakeTransport()
         fake.open()
         fake.queue_reply(b"A5 NO PROBE\r")
-        protocol = Group3Protocol(fake, echo_enabled=True)
+        protocol = Group3Protocol(fake, expect_command_returned=True)
         session = G3CLSession(protocol)
         with pytest.raises(NoProbeError):
             session.select(5).send("F")
@@ -235,7 +235,7 @@ class TestAddressedProtocol:
         # Second call: addr.send("F").
         fake.queue_reply(b"A5\n")    # An echo + ack for the second select
         fake.queue_reply(b"F 0.5T\r")  # F echo + reply
-        protocol = Group3Protocol(fake, echo_enabled=True)
+        protocol = Group3Protocol(fake, expect_command_returned=True)
         session = G3CLSession(protocol)
         session.select(5).send_no_reply("SM1")
         assert session.select(5).send("F") == " 0.5T"

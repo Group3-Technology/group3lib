@@ -27,6 +27,7 @@ from group3.exceptions import (
 from group3.protocol import commands
 from group3.protocol.core import Group3Protocol
 from group3.protocol.parser import (
+    check_error,
     parse_baud_code,
     parse_bool_flag,
     parse_dip_switches,
@@ -98,6 +99,30 @@ _SCRIPT_REQUEST_COMMANDS = frozenset(
 _SCRIPT_WRITE_ONLY_COMMANDS = frozenset({"V", "SM0", "SM1"})
 
 
+def _start_auto_transmit(protocol: Group3Protocol) -> None:
+    """Send ``SM1`` and clear the returned command off the wire.
+
+    ``SMn`` carries no payload reply, so it goes out write-only. On a link
+    that returns commands — a G3CL loop rippling the message back (manual
+    §4.5.1, page 4-7) or DIP S2-4 echo — the ``SM1`` text is then left in
+    the buffer, and the first streaming read parses it as a reading.
+    Bench-observed on an FTR fiber-optic link (2026-07-26): the stream died
+    on ``ProtocolError("Expected numeric field reply, got 'SM1'")``.
+
+    Request/reply commands never hit this because
+    :meth:`~group3.transport.serial.SerialTransport.request` resets the
+    input buffer before writing; a streaming read cannot.
+
+    Streaming is stopped when this runs, so the returned command and its
+    bare-terminator ack are the only bytes in flight. If the device is
+    free-running anyway (DIP S2-1 ON, "transmit every reading"), the drain
+    sees a reading instead and raises rather than silently desyncing.
+    """
+    protocol.send_no_reply(commands.SM1)
+    if protocol.expect_command_returned:
+        protocol.drain_setter_ack(echo_command=commands.SM1)
+
+
 class DTM151Serial:
     """Driver for the DTM-151-S Digital Teslameter.
 
@@ -114,23 +139,60 @@ class DTM151Serial:
     # connect-time identification
     # ------------------------------------------------------------------
 
+    def detect_command_echo(self) -> bool:
+        """Probe whether commands come back on the wire ahead of their replies.
+
+        Sends ``Ctrl-B`` (``\\x02``, the baud-rate switch query — the cheapest
+        reply the device offers) and reports whether the command was returned
+        first. Both causes look identical on the wire and both are handled the
+        same way, so this single probe covers them: the device's S2-4 echo
+        (manual §3.6, page 3-11) and a G3CL loop rippling the message back to
+        the host (manual §4.5.1, page 4-7).
+
+        The result is recorded on the underlying
+        :class:`~group3.protocol.core.Group3Protocol` as
+        :attr:`~group3.protocol.core.Group3Protocol.expect_command_returned`,
+        so subsequent commands strip the returned prefix correctly.
+
+        Returns:
+            ``True`` if the command came back before its reply.
+
+        Raises:
+            NotImplementedError: ``self._protocol`` is not a
+                :class:`Group3Protocol` (control bytes are not supported via
+                the addressed G3CL protocol in this release).
+        """
+        protocol = self._protocol
+        if not isinstance(protocol, Group3Protocol):
+            raise NotImplementedError(
+                "detect_command_echo() requires a direct Group3Protocol; G3CL "
+                "multi-drop probing is not supported in this release."
+            )
+        protocol.send_control(commands.CTRL_B, expect_echo=None)
+        return protocol.expect_command_returned
+
     def identify(self, coerce_echo_off: bool = True) -> DeviceProfile:
         """Read the device's DIP-switch state and baud-rate switch.
 
         Probes the device with ``Ctrl-D`` (``\\x04``) and ``Ctrl-B`` (``\\x02``)
         to capture its boot-time configuration into a :class:`DeviceProfile`.
-        The echo state is auto-detected from the first reply and recorded on the
-        underlying :class:`Group3Protocol` so subsequent commands strip the echo
-        prefix correctly.
+        Whether commands come back on the wire is auto-detected from the first
+        reply and recorded on the underlying :class:`Group3Protocol` so
+        subsequent commands strip the returned prefix correctly.
 
         Recommended as the first call after :meth:`Group3Protocol` is wired to a
         live transport — both for logging the device profile and for normalising
         echo state across firmware DIP defaults.
 
         Args:
-            coerce_echo_off: When ``True`` (default), if the device reports echo
-                ON the method sends ``SE0`` to disable it for the rest of the
-                session. Set ``False`` to leave echo state as the device booted.
+            coerce_echo_off: When ``True`` (default), if commands are being
+                returned the method sends ``SE0`` and then re-probes with
+                :meth:`detect_command_echo`. ``SE0`` clears the device's S2-4
+                echo but cannot stop a G3CL loop from rippling commands back,
+                so the re-probe — not the ``SE0`` ack — decides the final
+                state. A device that still returns commands afterwards is on
+                a loop, reported as :attr:`DeviceProfile.loop_echo`. Set
+                ``False`` to leave echo state as the device booted.
 
         Returns:
             A :class:`DeviceProfile` snapshot. Note that on G3CL multi-drop
@@ -157,17 +219,41 @@ class DTM151Serial:
         dip_reply = protocol.send_control(commands.CTRL_D, expect_echo=None)
         dip = parse_dip_switches(dip_reply)
 
-        # send_control already updated protocol.echo_enabled from the auto-detect.
+        # send_control already updated protocol.expect_command_returned from
+        # the auto-detect.
         baud_reply = protocol.send_control(
-            commands.CTRL_B, expect_echo=protocol.echo_enabled
+            commands.CTRL_B, expect_echo=protocol.expect_command_returned
         )
         baud = parse_baud_code(baud_reply)
 
-        if coerce_echo_off and protocol.echo_enabled:
-            protocol.send_setter(commands.SE0)
-            protocol.echo_enabled = False
+        loop_echo = False
+        if coerce_echo_off and protocol.expect_command_returned:
+            # Deliberately not send_setter(): this is a repair, and it runs
+            # exactly when the link is misbehaving. Bench-observed on an FTR
+            # loop with echo ON (2026-07-26): the device's echoed copy of an
+            # ASCII command comes back corrupted (``SE0`` returned as
+            # ``b'S\\x05`\\x000'``), so a strict echo-prefix check would abort
+            # the one call that fixes the link. Write it, absorb whatever
+            # comes back, and let the re-probe below establish the truth.
+            drained = protocol.send_unvalidated(commands.SE0)
+            # Corruption is expected in that drain, so decode leniently — but
+            # a recognisable §4.5.3 error still means SE0 was rejected, and
+            # reporting loop_echo for a device that simply refused the command
+            # would be a lie.
+            check_error(drained.decode("ascii", errors="ignore"))
+            # SE0 turns off the device's own echo, but on a G3CL loop the
+            # command is still retransmitted around the loop back to the host
+            # (manual §4.5.1, page 4-7). Re-probe instead of assuming the ack
+            # means silence — assuming it leaves the protocol stripping a
+            # prefix that is still arriving, and every later reply desyncs.
+            loop_echo = self.detect_command_echo()
 
-        return DeviceProfile(dip=dip, baud=baud, echo_enabled=protocol.echo_enabled)
+        return DeviceProfile(
+            dip=dip,
+            baud=baud,
+            command_returned=protocol.expect_command_returned,
+            loop_echo=loop_echo,
+        )
 
     # ------------------------------------------------------------------
     # field measurement
@@ -331,9 +417,10 @@ class DTM151Serial:
     def set_echo(self, enabled: bool) -> None:
         """Enable or disable the device's command-echo behaviour (``SEn``).
 
-        Updates the underlying :class:`Group3Protocol`'s :attr:`echo_enabled`
+        Updates the underlying :class:`Group3Protocol`'s
+        :attr:`~group3.protocol.core.Group3Protocol.expect_command_returned`
         flag after the device acknowledges, so subsequent reply parsing
-        strips (or doesn't strip) the echoed prefix correctly. Order is
+        strips (or doesn't strip) the returned prefix correctly. Order is
         important: the device-side change is applied first, then the local
         flag is updated, so a failed ack leaves the protocol in its prior
         consistent state.
@@ -342,11 +429,18 @@ class DTM151Serial:
         sessions (an :class:`AddressedProtocol` exposes its underlying
         protocol via :attr:`inner` — without that walkthrough, addressed
         traffic after ``SE1`` would mis-parse the echoed ``An`` prefix).
+
+        .. warning::
+           ``SE0`` only clears the device's own echo. On a G3CL loop the
+           command is still rippled back to the host by the loop itself
+           (manual §4.5.1, page 4-7), so ``set_echo(False)`` will leave the
+           protocol expecting silence that never comes. Follow it with
+           :meth:`detect_command_echo` on a loop link.
         """
         self._protocol.send_setter(commands.se_set_echo(enabled))
         underlying = getattr(self._protocol, "inner", self._protocol)
         if isinstance(underlying, Group3Protocol):
-            underlying.echo_enabled = enabled
+            underlying.expect_command_returned = enabled
 
     # ------------------------------------------------------------------
     # restart / reset (control-byte commands, vendor command reference)
@@ -358,7 +452,8 @@ class DTM151Serial:
         Re-runs the firmware boot sequence and returns the banner string
         (e.g. ``"GROUP3 DTMS 7.10"``). Numerical user settings are NOT
         cleared unless DIP S2-8 is ON. Echo state is the device's runtime
-        state from before — the protocol's :attr:`echo_enabled` is not
+        state from before — the protocol's
+        :attr:`~group3.protocol.core.Group3Protocol.expect_command_returned` is not
         modified.
 
         Returns:
@@ -377,7 +472,7 @@ class DTM151Serial:
                 "commands are not supported on G3CL multi-drop sessions."
             )
         return protocol.send_control(
-            commands.CTRL_U, expect_echo=protocol.echo_enabled
+            commands.CTRL_U, expect_echo=protocol.expect_command_returned
         )
 
     def reset_to_defaults(self) -> None:
@@ -390,7 +485,8 @@ class DTM151Serial:
         rather than the device-error it would otherwise represent.
 
         .. warning::
-           After this call the protocol's cached :attr:`echo_enabled` may
+           After this call the protocol's cached
+           :attr:`~group3.protocol.core.Group3Protocol.expect_command_returned` may
            be stale (echo reverts to S2-4's default at reset). Call
            :meth:`identify` to refresh the profile.
 
@@ -408,7 +504,7 @@ class DTM151Serial:
         # expected success indicator.
         with suppress(ResetError):
             protocol.send_control(
-                commands.CTRL_X, expect_echo=protocol.echo_enabled
+                commands.CTRL_X, expect_echo=protocol.expect_command_returned
             )
 
     # ------------------------------------------------------------------
@@ -589,7 +685,19 @@ class DTM151Serial:
         other setters we do not drain for a deferred error. After ``SM1``
         the next bytes on the bus are real streaming readings, not an
         error code.
+
+        The exception is a link that returns commands (see
+        :func:`_start_auto_transmit`): there ``SM1`` must be cleared off the
+        wire before streaming reads begin.
         """
+        protocol = self._protocol
+        if enabled and isinstance(protocol, Group3Protocol):
+            _start_auto_transmit(protocol)
+            return
+        # SM0 needs no such care: the bus is either quiet (a later request()
+        # resets the input buffer anyway) or still streaming, in which case
+        # the caller drains in-flight readings and the returned command
+        # together via drain_pending.
         self._protocol.send_no_reply(commands.sm_set_send_mode(enabled))
 
     def set_sampling_interval(self, seconds: int) -> None:
@@ -803,7 +911,7 @@ class FieldStream:
             yield
         finally:
             try:
-                self._protocol.send_no_reply(commands.SM1)
+                _start_auto_transmit(self._protocol)
             finally:
                 self._paused = False
 
