@@ -21,6 +21,7 @@ configurations (CR, LF, CR+LF, LF+CR) without configuration.
 
 from __future__ import annotations
 
+import contextlib
 import time
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
@@ -129,6 +130,13 @@ class SerialTransport:
             # tail of a previous session. Those bytes belong to no exchange.
             self._ser.reset_input_buffer()
         except serial.SerialException as exc:
+            # The flush runs after construction, so self._ser may hold a live
+            # port whose is_open is True. Left there, the next open() returns
+            # on it immediately and hands back a port that was never flushed.
+            if self._ser is not None:
+                with contextlib.suppress(Exception):
+                    self._ser.close()
+                self._ser = None
             raise TransportError(f"Failed to open serial port {self._port!r}: {exc}") from exc
 
     def close(self) -> None:

@@ -120,6 +120,42 @@ class TestOpenClose:
         with pytest.raises(TransportError, match="could not open port"):
             t.open()
 
+    def test_failed_open_flush_does_not_leave_a_live_port(
+        self, fake_serial: _FakeSerialModule
+    ) -> None:
+        """A port whose opening flush failed must not look open.
+
+        The flush runs after construction, so without cleanup ``self._ser``
+        keeps a live instance whose ``is_open`` is True — and the next
+        ``open()`` returns straight away on that, handing back a port that
+        was never flushed and whose failure was already reported.
+        """
+        failures = {"count": 1}
+
+        def _flaky_reset(self: _FakeSerial) -> None:
+            if failures["count"] > 0:
+                failures["count"] -= 1
+                raise fake_serial.SerialException("device disconnected")
+            self.input_buffer_resets += 1
+
+        monkey = _FakeSerial.reset_input_buffer
+        _FakeSerial.reset_input_buffer = _flaky_reset  # type: ignore[method-assign]
+        try:
+            t = _transport()
+            with pytest.raises(TransportError, match="device disconnected"):
+                t.open()
+            first = fake_serial.last_instance
+            assert first is not None and first.closed
+
+            # The retry must construct a fresh port and flush it, not return
+            # the half-initialised one.
+            t.open()
+            assert fake_serial.last_instance is not None
+            assert fake_serial.last_instance is not first
+            assert fake_serial.last_instance.input_buffer_resets == 1
+        finally:
+            _FakeSerial.reset_input_buffer = monkey  # type: ignore[method-assign]
+
     def test_context_manager(self, fake_serial: _FakeSerialModule) -> None:
         with _transport():
             assert fake_serial.last_instance is not None
