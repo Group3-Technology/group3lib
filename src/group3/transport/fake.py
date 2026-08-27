@@ -124,7 +124,7 @@ class FakeTransport:
         # The queued-reply deque is *not* touched — write_only has no read half.
 
     def reset_input(self) -> None:
-        """Discard queued replies, modelling a flush of buffered input.
+        """Discard stale input, modelling a flush of the buffer.
 
         Clears only the :meth:`queue_stale` deque. Queued replies and a
         :meth:`scripted` sequence describe what the device sends *after* the
