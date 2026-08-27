@@ -278,16 +278,24 @@ class TestReadOptional:
 
 
 class TestRequestMechanics:
+    def test_open_resets_buffer(self, fake_serial: _FakeSerialModule) -> None:
+        """A port opens onto bytes that belong to no exchange — drop them."""
+        t = _transport()
+        t.open()
+        assert fake_serial.last_instance is not None
+        assert fake_serial.last_instance.input_buffer_resets == 1
+
     def test_request_writes_payload_and_resets_buffer(
         self, fake_serial: _FakeSerialModule
     ) -> None:
         t = _transport()
         t.open()
         assert fake_serial.last_instance is not None
+        resets_after_open = fake_serial.last_instance.input_buffer_resets
         fake_serial.last_instance.queue_rx(b" 0\r")
         t.request(b"IR\r")
         assert bytes(fake_serial.last_instance.written) == b"IR\r"
-        assert fake_serial.last_instance.input_buffer_resets == 1
+        assert fake_serial.last_instance.input_buffer_resets == resets_after_open + 1
 
     def test_write_only_does_not_read(self, fake_serial: _FakeSerialModule) -> None:
         t = _transport()

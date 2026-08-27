@@ -124,6 +124,10 @@ class SerialTransport:
                 rtscts=self._rtscts,
                 xonxoff=self._xonxoff,
             )
+            # A port opens onto whatever the device emitted while nobody was
+            # listening — power-on banners, an S2-1 free-running stream, the
+            # tail of a previous session. Those bytes belong to no exchange.
+            self._ser.reset_input_buffer()
         except serial.SerialException as exc:
             raise TransportError(f"Failed to open serial port {self._port!r}: {exc}") from exc
 
@@ -154,10 +158,7 @@ class SerialTransport:
         try:
             ser.timeout = effective_timeout
             try:
-                ser.reset_input_buffer()
-                # reset_input_buffer wipes the OS buffer; any residue we'd
-                # stashed for push-back is now stale and must be dropped too.
-                self._pushback = b""
+                self.reset_input()
                 ser.write(payload)
                 ser.flush()
             except Exception as exc:
@@ -260,6 +261,20 @@ class SerialTransport:
                 # Restore non-terminator for the read to consume.
                 self._pushback = byte
                 return
+
+    def reset_input(self) -> None:
+        """Discard buffered input, including our own push-back byte.
+
+        ``reset_input_buffer`` wipes the OS buffer only; the push-back byte
+        lives in this object and would otherwise survive as the first byte
+        of the next read.
+        """
+        ser = self._require_open()
+        try:
+            ser.reset_input_buffer()
+        except Exception as exc:
+            raise TransportError(f"Failed to reset serial input buffer: {exc}") from exc
+        self._pushback = b""
 
     def write_only(self, payload: bytes) -> None:
         ser = self._require_open()

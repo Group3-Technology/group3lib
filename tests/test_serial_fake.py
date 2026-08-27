@@ -23,6 +23,7 @@ from group3 import (
 # --------------------------------------------------------------------------- #
 
 SENT_F = b"F\r"
+SENT_SU1 = b"SU1\r"
 SENT_P = b"P\r"
 SENT_IR = b"IR\r"
 SENT_R2 = b"R2\r"
@@ -107,6 +108,75 @@ class TestErrorReplies:
         p = Group3Protocol(fake)
         with pytest.raises(DeviceOverflowError):
             p.send("F")
+
+
+# Left on the wire by an earlier exchange: a late reply, an undrained ack, or
+# an S2-1 stream that was running before we connected. Issue #6.
+STALE_FRAME = b" INVALID COMMAND ENTRY\n\r"
+ACK_BARE_LF = b"\n"
+
+
+class TestStaleInputBeforeWrite:
+    """A frame buffered before the write belongs to no exchange (issue #6).
+
+    ``request`` has always flushed before writing, so getters self-healed
+    while setters — which write via ``write_only`` and then read — inherited
+    whatever was pending and read it as their own reply. Reported against
+    v0.3.0 over an FTDI FT4232H at 9600 7E2, where it failed ``SU1`` on most
+    connections while ``IR`` and ``F`` were unaffected on the same link.
+    """
+
+    def test_setter_discards_stale_frame(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_stale(STALE_FRAME)
+        fake.queue_reply(ACK_BARE_LF)
+        p = Group3Protocol(fake)
+        p.send_setter("SU1")
+        assert fake.sent == [SENT_SU1]
+        assert p.last_raw_rx == ACK_BARE_LF
+
+    def test_getter_discards_stale_frame(self) -> None:
+        """The half that already worked — pinned so the fix stays symmetric."""
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_stale(STALE_FRAME)
+        fake.queue_reply(b" 3\r")
+        p = Group3Protocol(fake)
+        assert p.send("IR") == " 3"
+        assert fake.sent == [SENT_IR]
+
+    def test_stale_frame_does_not_mask_a_real_setter_error(self) -> None:
+        """Flushing must not swallow the error the setter itself provokes."""
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_stale(STALE_FRAME)
+        fake.queue_reply(b" NO PROBE\r")
+        p = Group3Protocol(fake)
+        with pytest.raises(NoProbeError):
+            p.send_setter("Z")
+
+    def test_send_unvalidated_discards_stale_frame(self) -> None:
+        """The repair path runs when the link is dirty — it must flush too."""
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_stale(STALE_FRAME)
+        fake.queue_reply(ACK_BARE_LF)
+        p = Group3Protocol(fake)
+        assert p.send_unvalidated("SE0") == ACK_BARE_LF
+
+    def test_write_only_preserves_the_reply_stream(self) -> None:
+        """``send_no_reply`` has no read half, so it must not flush.
+
+        ``FieldStream.paused`` sends ``SM0`` this way precisely so that an
+        in-flight reading survives to be drained deliberately.
+        """
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_stale(b" 1.2345T\n\r")
+        p = Group3Protocol(fake)
+        p.send_no_reply("SM0")
+        assert p.drain_pending() == [b" 1.2345T\n\r"]
 
 
 class TestSendSetter:

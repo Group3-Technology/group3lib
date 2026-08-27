@@ -65,7 +65,7 @@ class _LoopSerial:
         self.closed = False
 
     def reset_input_buffer(self) -> None:
-        pass
+        self._rx.clear()  # a real flush discards; the examples must survive it
 
     @property
     def in_waiting(self) -> int:
