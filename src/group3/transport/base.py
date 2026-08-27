@@ -49,6 +49,14 @@ class Transport(Protocol):
     def write_only(self, payload: bytes) -> None:
         """Write ``payload`` without reading a reply. Used for broadcast commands."""
 
+    def reset_input(self) -> None:
+        """Discard any input that arrived before now.
+
+        Called by the protocol layer at the start of an exchange that writes
+        and then reads, so a frame left over from a previous exchange cannot
+        be served as this one's reply. Implementations must not block.
+        """
+
     def read_optional(self, timeout: float) -> bytes:
         """Read a reply if the device sends one within ``timeout`` seconds.
 

@@ -10,6 +10,10 @@
    payload. Useful when you only want to test the reply direction.
 3. **Queued error** — :meth:`queue_error` enqueues an exception that the next
    :meth:`request` will raise, for exercising transport/device error paths.
+4. **Stale input** — :meth:`queue_stale` seeds bytes that are *already buffered*
+   before the next command is written, which is what :meth:`reset_input`
+   discards. The queue in (2) models what the device sends *next*; with no
+   clock, the two cannot be told apart without saying which is which.
 
 All sent payloads are appended to :attr:`sent` (a public list) for inspection.
 """
@@ -31,6 +35,7 @@ class FakeTransport:
     def __init__(self) -> None:
         self.sent: list[bytes] = []
         self._replies: deque[_QueueItem] = deque()
+        self._stale: deque[bytes] = deque()
         self._scripted: deque[tuple[bytes, _QueueItem]] = deque()
         self._is_open = False
 
@@ -45,6 +50,15 @@ class FakeTransport:
     def queue_error(self, exc: BaseException) -> None:
         """Enqueue an exception to be raised by the next :meth:`request`."""
         self._replies.append(exc)
+
+    def queue_stale(self, data: bytes) -> None:
+        """Seed input that is already buffered before the next command is sent.
+
+        Models a frame left behind by an earlier exchange — a late reply, an
+        undrained ack, an S2-1 stream. Reads serve these ahead of
+        :meth:`queue_reply` items; :meth:`reset_input` discards them.
+        """
+        self._stale.append(data)
 
     def scripted(self, exchanges: list[tuple[bytes, bytes]]) -> None:
         """Pin an ordered sequence of expected-sent + reply bytes.
@@ -75,6 +89,7 @@ class FakeTransport:
         del timeout  # Fake transport does not simulate timeouts unless queued as an error.
         if not self._is_open:
             raise TransportError("FakeTransport is not open. Call open() first.")
+        self.reset_input()  # mirrors SerialTransport.request
         self.sent.append(payload)
 
         if self._scripted:
@@ -108,6 +123,17 @@ class FakeTransport:
             )
         # The queued-reply deque is *not* touched — write_only has no read half.
 
+    def reset_input(self) -> None:
+        """Discard stale input, modelling a flush of the buffer.
+
+        Clears only the :meth:`queue_stale` deque. Queued replies and a
+        :meth:`scripted` sequence describe what the device sends *after* the
+        next write, so a flush cannot reach them.
+        """
+        if not self._is_open:
+            raise TransportError("FakeTransport is not open. Call open() first.")
+        self._stale.clear()
+
     def read_optional(self, timeout: float) -> bytes:
         """Pop and return the next queued reply, or ``b""`` if the queue is empty.
 
@@ -119,6 +145,8 @@ class FakeTransport:
         del timeout  # FakeTransport does not model wall-clock timeouts here.
         if not self._is_open:
             raise TransportError("FakeTransport is not open. Call open() first.")
+        if self._stale:
+            return self._stale.popleft()
         if not self._replies:
             return b""
         item = self._replies.popleft()
@@ -135,6 +163,8 @@ class FakeTransport:
         del timeout  # FakeTransport does not model wall-clock timeouts here.
         if not self._is_open:
             raise TransportError("FakeTransport is not open. Call open() first.")
+        if self._stale:
+            return self._stale.popleft()
         if not self._replies:
             raise Group3TimeoutError(
                 "FakeTransport.read_reply: no reply queued (streaming stall)"

@@ -432,6 +432,9 @@ class Group3Protocol:
         """
         payload = codec.encode(command, self.terminator)
         full_tx = bytes(self._pending_tx) + payload
+        # Writes-then-reads, so anything already buffered would be drained as
+        # this command's output. See send_setter for the full rationale.
+        self.transport.reset_input()
         self.transport.write_only(payload)
         # This *is* the whole exchange — nothing later should inherit it.
         self._pending_tx.clear()
@@ -565,6 +568,11 @@ class Group3Protocol:
             ProtocolError: A non-empty, non-error reply arrived.
         """
         payload = codec.encode(command, self.terminator)
+        # A setter writes and then reads, so a frame still buffered from an
+        # earlier exchange would be read as this setter's ack or error. The
+        # getter path gets this for free inside transport.request(); without
+        # it here, setters inherit stale input and getters do not.
+        self.transport.reset_input()
         self.transport.write_only(payload)
         self._pending_tx.extend(payload)
         full_tx = bytes(self._pending_tx)
