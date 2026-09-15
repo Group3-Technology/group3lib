@@ -39,6 +39,20 @@ class _FakeSerial:
     def queue_rx(self, data: bytes) -> None:
         self._rx_queue.extend(data)
 
+    @property
+    def in_waiting(self) -> int:
+        """Bytes readable without blocking, as ``serial.Serial`` reports them.
+
+        The double did without this for a long time because the only caller,
+        ``_drain_leading_terminators``, wrapped the access in a bare
+        ``except`` and treated the failure as "nothing buffered" — so the
+        fake silently exercised the error path in every test. ``read_optional``
+        now polls it to wait for the first byte without reconfiguring the
+        port, and a double that models the real API is what makes those tests
+        mean anything.
+        """
+        return len(self._rx_queue)
+
     def reset_input_buffer(self) -> None:
         # Real pyserial clears pending OS-buffered bytes. In tests we queue the
         # device's *future* response, so this counter records the call for
