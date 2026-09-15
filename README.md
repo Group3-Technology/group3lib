@@ -328,6 +328,25 @@ did nothing or broke something. The `SerialTransport` tests separately verify
 every DIP-switch-documented reply terminator (CR, LF, CR+LF, LF+CR) plus
 timeout and error-wrapping behaviour.
 
+They also pin one invariant that is invisible in the bytes and easy to undo:
+
+> **The port is never reconfigured between a write and the first reply byte.**
+
+On Windows, assigning `ser.timeout` is a port reconfiguration (pyserial's
+`_reconfigure_port` → `SetCommTimeouts`). Doing it while the command just
+written is still in the adapter's transmit FIFO corrupts it on the wire, and
+the instrument answers `INVALID COMMAND ENTRY` or `PARITY ERROR` to a command
+that left byte-perfect. It cost every setter — `SU1`, `Ufc`, `Rn`, `Z`,
+filter, AC/DC — a 20–90% failure rate on an FT4232H, and took streaming with
+them, while every getter stayed clean because `request()` sets its timeout
+*before* writing. macOS was unaffected, so it only appears on a Windows
+bench.
+
+Reconfiguring *after* a reply byte is safe — the device answered, so nothing
+of ours is still in flight — which is why `request()` and the trailing-
+terminator peek may both still do it. Waiting for a *first* byte must poll
+instead: see `SerialTransport._wait_for_first_byte`.
+
 Real-hardware smoke tests are manual — see
 [`examples/read_field.py`](examples/read_field.py),
 [`examples/read_temperature.py`](examples/read_temperature.py),

@@ -35,12 +35,16 @@ class _FakeSerial:
         self._timeout: float | None = kwargs.get("timeout")
         self.closed = False
         self.input_buffer_resets = 0
-        # Every assignment to .timeout, with how many bytes had been written
-        # at the time. On Windows each assignment is a port reconfiguration
-        # (pyserial's _reconfigure_port -> SetCommTimeouts), so *when* it
-        # happens is load-bearing - see
-        # test_read_optional_never_reconfigures_the_port.
-        self.timeout_writes: list[tuple[float | None, int]] = []
+        self.bytes_read = 0
+        self._in_waiting_polls = 0
+        self._rx_available_after = 0
+        # Every assignment to .timeout, as (value, bytes_written_so_far,
+        # bytes_read_so_far). On Windows each assignment is a port
+        # reconfiguration (pyserial's _reconfigure_port -> SetCommTimeouts),
+        # and the hazard is specific to the window between a write and the
+        # first reply byte - so both counts are needed to tell a safe
+        # reconfiguration from a corrupting one.
+        self.timeout_writes: list[tuple[float | None, int, int]] = []
 
     @property
     def timeout(self) -> float | None:
@@ -48,11 +52,23 @@ class _FakeSerial:
 
     @timeout.setter
     def timeout(self, value: float | None) -> None:
-        self.timeout_writes.append((value, len(self.written)))
+        self.timeout_writes.append((value, len(self.written), self.bytes_read))
         self._timeout = value
 
     def queue_rx(self, data: bytes) -> None:
         self._rx_queue.extend(data)
+
+    def reply_after_polls(self, polls: int) -> None:
+        """Model a device that does not answer instantly.
+
+        Without this the queued reply is readable the moment the transport
+        looks, so ``_drain_leading_terminators`` consumes a byte before the
+        first-byte wait even begins - and a guard checking "was the port
+        reconfigured before any reply arrived" is satisfied vacuously. Real
+        hardware takes milliseconds to answer, which is precisely the window
+        the reconfiguration corrupts.
+        """
+        self._rx_available_after = polls
 
     @property
     def in_waiting(self) -> int:
@@ -66,6 +82,9 @@ class _FakeSerial:
         port, and a double that models the real API is what makes those tests
         mean anything.
         """
+        self._in_waiting_polls += 1
+        if self._in_waiting_polls <= self._rx_available_after:
+            return 0
         return len(self._rx_queue)
 
     def reset_input_buffer(self) -> None:
@@ -86,6 +105,7 @@ class _FakeSerial:
             return b""
         take = self._rx_queue[:n]
         del self._rx_queue[:n]
+        self.bytes_read += len(take)
         return bytes(take)
 
     def close(self) -> None:
@@ -313,63 +333,94 @@ class TestReadReply:
 class TestReadOptional:
     """Cover the drain path used by Group3Protocol.send_setter()."""
 
-    def test_read_optional_never_reconfigures_the_port(
+    def test_read_optional_does_not_reconfigure_before_the_first_byte(
         self, fake_serial: _FakeSerialModule
     ) -> None:
-        """Regression: assigning ``ser.timeout`` here corrupts the command.
+        """Regression: reconfiguring here corrupts the command just written.
 
-        ``read_optional`` is called immediately after ``write_only`` on the
-        setter path. On Windows, assigning ``ser.timeout`` reconfigures the
-        port (pyserial's ``_reconfigure_port`` -> ``SetCommTimeouts``), and
-        doing that while the command is still in the adapter's transmit FIFO
-        corrupts the bytes going out: the instrument receives garbage and
-        answers ``INVALID COMMAND ENTRY`` or ``PARITY ERROR``.
+        On Windows, assigning ``ser.timeout`` reconfigures the port
+        (pyserial's ``_reconfigure_port`` -> ``SetCommTimeouts``).
+        ``read_optional`` runs immediately after ``write_only`` on the setter
+        path, so a reconfiguration lands while the command is still in the
+        adapter's transmit FIFO and corrupts it: the instrument answers
+        ``INVALID COMMAND ENTRY`` or ``PARITY ERROR`` to a command that left
+        byte-perfect.
 
-        Bench-measured on Windows over an FT4232H at 9600 7E2, ``R2`` sixty
-        times per configuration: write/settle/read scored 0/60 failures,
-        write/``ser.timeout = x``/settle/read scored 10/60 and 17/60. Through
-        the library it made every setter -- ``SU1``, ``Ufc``, ``Rn``, ``Z``,
-        filter, AC/DC -- fail between 20% and 90% of the time, and took
-        streaming with them, because ``stream_field`` sets its interval with
-        ``Kn``.
+        Bench-measured over an FT4232H at 9600 7E2 - ``R2`` sixty times -
+        write/settle/read scored 0/60 failures against 10/60 and 17/60 for
+        write/``ser.timeout = x``/settle/read.
 
-        ``request`` has always assigned ``ser.timeout`` *before* its write,
-        which is exactly why getters were unaffected on the same connection.
-
-        The corruption happens inside the driver and cannot be seen in the
-        fake's bytes, so the guard is on the behaviour instead: wait for the
-        first byte by polling, never by reconfiguring.
+        The reply here is a full one, not a bare ack: an ack is consumed by
+        ``_drain_leading_terminators`` and returns early, which would let the
+        whole reply path go unexercised.
         """
         t = _transport(timeout=1.0)
         t.open()
         ser = t._ser
-        ser.queue_rx(b"\n")
+        t.write_only(b"R2\r")
+        ser.queue_rx(b" OVER RAN\r\n")
+        ser.reply_after_polls(3)  # the device takes a moment to answer
         ser.timeout_writes.clear()
 
-        t.read_optional(0.05)
+        out = t.read_optional(0.05)
 
-        assert ser.timeout_writes == [], (
-            "read_optional reconfigured the port: "
-            f"{ser.timeout_writes!r}. Wait for the first byte by polling "
-            "in_waiting instead."
+        assert out == b" OVER RAN\r\n", "the reply path must actually run"
+        before_first_byte = [w for w in ser.timeout_writes if w[2] == 0]
+        assert before_first_byte == [], (
+            "the port was reconfigured before the first reply byte: "
+            f"{before_first_byte!r}"
         )
 
-    def test_write_only_then_read_optional_leaves_the_port_alone(
+    def test_read_reply_does_not_reconfigure_before_the_first_byte(
         self, fake_serial: _FakeSerialModule
     ) -> None:
-        """The real sequence a setter performs: write, then read the ack."""
+        """Same window, the streaming path.
+
+        ``_start_auto_transmit`` sends ``SM1`` write-only and the first
+        streaming read lands in ``read_reply``, so it sits inside the same
+        post-write window. Missing this was why streaming still failed after
+        the first attempt at this fix.
+        """
         t = _transport(timeout=1.0)
         t.open()
         ser = t._ser
+        t.write_only(b"SM1\r")
+        ser.queue_rx(b" 0.71G\n\r")
+        ser.reply_after_polls(3)  # the device takes a moment to answer
         ser.timeout_writes.clear()
 
-        t.write_only(b"R2\r")
-        ser.queue_rx(b"\n")
-        t.read_optional(0.05)
+        out = t.read_reply(0.5)
 
-        after_write = [w for w in ser.timeout_writes if w[1] > 0]
-        assert after_write == [], (
-            f"the port was reconfigured after the command went out: {after_write!r}"
+        assert out == b" 0.71G\n\r", "the reply path must actually run"
+        before_first_byte = [w for w in ser.timeout_writes if w[2] == 0]
+        assert before_first_byte == [], (
+            "the port was reconfigured before the first reply byte: "
+            f"{before_first_byte!r}"
+        )
+
+    def test_request_may_reconfigure_because_it_does_so_before_writing(
+        self, fake_serial: _FakeSerialModule
+    ) -> None:
+        """The invariant is about ordering, not about never touching timeout.
+
+        ``request`` sets the timeout *before* its write, which is safe and is
+        exactly why getters were unaffected while every setter failed on the
+        same connection. Pinning it so a future change does not "fix" it into
+        the broken order.
+        """
+        t = _transport(timeout=1.0)
+        t.open()
+        ser = t._ser
+        ser.queue_rx(b" 2\n\r\n")
+        ser.timeout_writes.clear()
+
+        t.request(b"IR\r")
+
+        assert ser.timeout_writes, "request is expected to set a timeout"
+        first = ser.timeout_writes[0]
+        assert first[1] == 0, (
+            f"request reconfigured after writing {first[1]} bytes; it must do "
+            "so before the write"
         )
 
     def test_no_bytes_returns_empty_within_timeout(
