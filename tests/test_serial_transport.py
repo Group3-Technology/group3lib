@@ -331,9 +331,19 @@ class TestReadOptional:
 
     @staticmethod
     def _elapsed_write(t: SerialTransport, payload: bytes) -> float:
-        started = time.monotonic()
+        """Time a write with ``perf_counter``, not ``monotonic``.
+
+        These drains are single-digit milliseconds. On Windows under Python
+        3.10-3.12 ``monotonic`` is ``GetTickCount64`` at 15.6 ms resolution
+        (CPython moved it to ``QueryPerformanceCounter`` only in 3.13,
+        gh-88494), so a 5.67 ms drain can measure as 0.0 ms and fail a test
+        that is working perfectly. CI is Linux, so it would be invisible
+        there and would only bite on the Windows bench these tests exist
+        for.
+        """
+        started = time.perf_counter()
         t.write_only(payload)
-        return time.monotonic() - started
+        return time.perf_counter() - started
 
     def test_write_only_waits_for_the_payload_to_clock_out(
         self, fake_serial: _FakeSerialModule
