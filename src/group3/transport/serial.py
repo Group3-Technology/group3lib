@@ -241,6 +241,33 @@ class SerialTransport:
         finally:
             ser.timeout = saved
 
+    def _wait_for_first_byte(self, ser: _serial_types.Serial, timeout: float) -> bool:
+        """Wait up to ``timeout`` for a byte to be readable. No reconfiguration.
+
+        The obvious implementation is ``ser.timeout = timeout`` followed by a
+        one-byte read, and that is what this used to do. On Windows it
+        corrupts the command that was just written — see
+        :meth:`read_optional` — because assigning ``ser.timeout`` reconfigures
+        the port while bytes are still in the adapter's transmit FIFO.
+
+        Polling ``in_waiting`` costs a little CPU for the length of the error
+        window (50 ms by default, once per setter) and touches nothing on the
+        port. The 2 ms sleep keeps that cost negligible while staying far
+        below the ~1 ms it takes a single character to clock out at 9600 baud.
+        """
+        if self._pushback:
+            return True
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                if ser.in_waiting:
+                    return True
+            except Exception as exc:
+                raise TransportError(f"Failed to read from serial port: {exc}") from exc
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.002)
+
     def _drain_leading_terminators(self, ser: _serial_types.Serial) -> None:
         """Discard any leading terminator bytes from pushback + OS buffer.
 
@@ -352,47 +379,66 @@ class SerialTransport:
         Drains any leading terminator residue from the buffer first, so a
         prior reply whose terminator was longer than expected does not get
         served back here as an empty frame.
+
+        **Never assigns ``ser.timeout``.** On Windows that is a port
+        reconfiguration (pyserial's ``_reconfigure_port`` →
+        ``SetCommTimeouts``), and this method is called immediately after
+        ``write_only`` on the setter path. Reconfiguring the port while the
+        command is still in the adapter's transmit FIFO corrupts it on the
+        wire: the instrument receives garbage and answers ``INVALID COMMAND
+        ENTRY`` or ``PARITY ERROR``.
+
+        Bench-measured on Windows against a DTM-351-S over an FT4232H,
+        ``R2`` 60 times per configuration:
+
+        * write, settle, read ....................... 0/60 failed
+        * write, ``ser.timeout = x``, settle, read .. 10/60 and 17/60 failed
+
+        That ordering is the only reason setters failed where getters did
+        not: :meth:`request` assigns ``ser.timeout`` *before* its write,
+        this path assigned it after. It made ``SU1``, ``Ufc`` and ``Rn``
+        fail 20-90% of the time on Windows while every getter stayed clean,
+        and macOS was unaffected because termios does not reconfigure this
+        way.
+
+        The first-byte wait is therefore done by polling ``in_waiting``
+        against a deadline. Subsequent reads use the port's standing
+        timeout, which :meth:`open` already set to ``self._timeout``.
         """
         if timeout < 0:
             raise ValueError("timeout must be >= 0")
         ser = self._require_open()
-        original_timeout = ser.timeout
+        self._drain_leading_terminators(ser)
+        if not self._wait_for_first_byte(ser, timeout):
+            return b""
         try:
-            self._drain_leading_terminators(ser)
-            ser.timeout = timeout
+            first = self._read_byte(ser)
+        except Exception as exc:
+            raise TransportError(f"Failed to read from serial port: {exc}") from exc
+        if not first:
+            return b""
+        buf = bytearray(first)
+        if first[0] in self._terminator_bytes:
+            self._drain_trailing_terminators(ser, buf)
+            return bytes(buf)
+        deadline = time.monotonic() + self._timeout
+        term_bytes = self._terminator_bytes
+        while time.monotonic() < deadline:
             try:
-                first = self._read_byte(ser)
+                chunk = self._read_byte(ser)
             except Exception as exc:
-                raise TransportError(f"Failed to read from serial port: {exc}") from exc
-            if not first:
-                return b""
-            # Give the device room to finish sending — use the transport's
-            # default timeout for the remainder of the message.
-            ser.timeout = self._timeout
-            buf = bytearray(first)
-            if first[0] in self._terminator_bytes:
+                raise TransportError(
+                    f"Failed to read from serial port: {exc}"
+                ) from exc
+            if not chunk:
+                continue
+            buf.extend(chunk)
+            if chunk[0] in term_bytes:
                 self._drain_trailing_terminators(ser, buf)
                 return bytes(buf)
-            deadline = time.monotonic() + self._timeout
-            term_bytes = self._terminator_bytes
-            while time.monotonic() < deadline:
-                try:
-                    chunk = self._read_byte(ser)
-                except Exception as exc:
-                    raise TransportError(
-                        f"Failed to read from serial port: {exc}"
-                    ) from exc
-                if not chunk:
-                    continue
-                buf.extend(chunk)
-                if chunk[0] in term_bytes:
-                    self._drain_trailing_terminators(ser, buf)
-                    return bytes(buf)
-            # Partial reply but no terminator — return what we have. The
-            # protocol layer will likely raise ProtocolError.
-            return bytes(buf)
-        finally:
-            ser.timeout = original_timeout
+        # Partial reply but no terminator — return what we have. The
+        # protocol layer will likely raise ProtocolError.
+        return bytes(buf)
 
     # ------------------------------------------------------------------
     # context manager
