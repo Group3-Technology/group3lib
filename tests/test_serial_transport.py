@@ -36,16 +36,11 @@ class _FakeSerial:
         self._timeout: float | None = kwargs.get("timeout")
         self.closed = False
         self.input_buffer_resets = 0
-        self.bytes_read = 0
-        self._in_waiting_polls = 0
-        self._rx_available_after = 0
-        # Every assignment to .timeout, as (value, bytes_written_so_far,
-        # bytes_read_so_far). On Windows each assignment is a port
-        # reconfiguration (pyserial's _reconfigure_port -> SetCommTimeouts),
-        # and the hazard is specific to the window between a write and the
-        # first reply byte - so both counts are needed to tell a safe
-        # reconfiguration from a corrupting one.
-        self.timeout_writes: list[tuple[float | None, int, int]] = []
+        # Every assignment to .timeout, with how many bytes had been
+        # written at the time. request() sets it *before* writing, which is
+        # safe and is why getters were unaffected while every setter failed
+        # on the same connection.
+        self.timeout_writes: list[tuple[float | None, int]] = []
 
     @property
     def timeout(self) -> float | None:
@@ -53,39 +48,21 @@ class _FakeSerial:
 
     @timeout.setter
     def timeout(self, value: float | None) -> None:
-        self.timeout_writes.append((value, len(self.written), self.bytes_read))
+        self.timeout_writes.append((value, len(self.written)))
         self._timeout = value
 
     def queue_rx(self, data: bytes) -> None:
         self._rx_queue.extend(data)
 
-    def reply_after_polls(self, polls: int) -> None:
-        """Model a device that does not answer instantly.
-
-        Without this the queued reply is readable the moment the transport
-        looks, so ``_drain_leading_terminators`` consumes a byte before the
-        first-byte wait even begins - and a guard checking "was the port
-        reconfigured before any reply arrived" is satisfied vacuously. Real
-        hardware takes milliseconds to answer, which is precisely the window
-        the reconfiguration corrupts.
-        """
-        self._rx_available_after = polls
-
     @property
     def in_waiting(self) -> int:
         """Bytes readable without blocking, as ``serial.Serial`` reports them.
 
-        The double did without this for a long time because the only caller,
-        ``_drain_leading_terminators``, wrapped the access in a bare
-        ``except`` and treated the failure as "nothing buffered" — so the
-        fake silently exercised the error path in every test. ``read_optional``
-        now polls it to wait for the first byte without reconfiguring the
-        port, and a double that models the real API is what makes those tests
-        mean anything.
+        The double did without this for a long time because its only caller,
+        ``_drain_leading_terminators``, wraps the access in a bare ``except``
+        and treats the failure as "nothing buffered" — so every test using
+        the fake silently exercised that error path.
         """
-        self._in_waiting_polls += 1
-        if self._in_waiting_polls <= self._rx_available_after:
-            return 0
         return len(self._rx_queue)
 
     def reset_input_buffer(self) -> None:
@@ -106,7 +83,6 @@ class _FakeSerial:
             return b""
         take = self._rx_queue[:n]
         del self._rx_queue[:n]
-        self.bytes_read += len(take)
         return bytes(take)
 
     def close(self) -> None:
@@ -334,6 +310,31 @@ class TestReadReply:
 class TestReadOptional:
     """Cover the drain path used by Group3Protocol.send_setter()."""
 
+    # Character times from first principles: one start bit, the data bits, a
+    # parity bit unless parity is disabled, then the stop bits. Written out
+    # per framing rather than recomputed from the implementation's formula -
+    # a test that mirrors the code it checks cannot catch a wrong formula,
+    # and getting this 9% low is enough to bring the corruption back.
+    # time.sleep() never returns early, so the measured drain can only be
+    # >= the computed one. The floor is 0.99 purely for clock granularity,
+    # not slack: an earlier 0.9 was wide enough to swallow the exact defect
+    # these tests exist to catch, since dropping 11 bits/char to 10 leaves
+    # 90.9% of the correct drain.
+    _SLEEP_FLOOR = 0.99
+
+    FRAMINGS = [
+        (dict(bytesize=7, parity="E", stopbits=2), 11),  # DTM-151-S default
+        (dict(bytesize=8, parity="N", stopbits=1), 10),
+        (dict(bytesize=8, parity="N", stopbits=2), 11),
+        (dict(bytesize=7, parity="N", stopbits=1), 9),
+    ]
+
+    @staticmethod
+    def _elapsed_write(t: SerialTransport, payload: bytes) -> float:
+        started = time.monotonic()
+        t.write_only(payload)
+        return time.monotonic() - started
+
     def test_write_only_waits_for_the_payload_to_clock_out(
         self, fake_serial: _FakeSerialModule
     ) -> None:
@@ -355,22 +356,18 @@ class TestReadOptional:
         failures; draining first scored 0/60 twice.
 
         Only the lower bound is asserted. Sleeping at least as long as the
-        wire needs is the property; sleeping a little longer is the scheduler
-        and not a defect.
+        wire needs is the property; sleeping longer is the scheduler.
         """
         t = _transport(timeout=1.0, baudrate=9600, bytesize=7, parity="E", stopbits=2)
         t.open()
 
-        started = time.monotonic()
-        t.write_only(b"R2\r")
-        elapsed = time.monotonic() - started
+        elapsed = self._elapsed_write(t, b"R2\r")
 
-        # 7E2 = 10 bits/char at 9600 baud; 3 payload chars + the margin.
-        expected = (3 + 2) * (10 / 9600)
-        assert elapsed >= expected * 0.9, (
+        expected = (3 + 2) * 11 / 9600
+        assert elapsed >= expected * self._SLEEP_FLOOR, (
             f"write_only returned after {elapsed * 1000:.2f} ms; the payload "
-            f"needs {expected * 1000:.2f} ms to clock out. Reconfiguring the "
-            "port this early corrupts the command."
+            f"needs {expected * 1000:.2f} ms to clock out at 7E2/9600. "
+            "Reconfiguring the port this early corrupts the command."
         )
 
     def test_the_drain_scales_with_the_payload(
@@ -380,34 +377,51 @@ class TestReadOptional:
         t = _transport(timeout=1.0, baudrate=9600, bytesize=7, parity="E", stopbits=2)
         t.open()
 
-        started = time.monotonic()
-        t.write_only(b"A" * 40 + b"\r")
-        long_write = time.monotonic() - started
+        elapsed = self._elapsed_write(t, b"A" * 40 + b"\r")
 
-        expected = (41 + 2) * (10 / 9600)
-        assert long_write >= expected * 0.9, (
-            f"a 41-character payload drained in {long_write * 1000:.2f} ms, "
-            f"less than the {expected * 1000:.2f} ms it takes on the wire"
+        expected = (41 + 2) * 11 / 9600
+        assert elapsed >= expected * self._SLEEP_FLOOR, (
+            f"a 41-character payload drained in {elapsed * 1000:.2f} ms, less "
+            f"than the {expected * 1000:.2f} ms it takes on the wire"
         )
 
-    def test_the_drain_scales_with_baud_and_framing(
-        self, fake_serial: _FakeSerialModule
-    ) -> None:
-        """Slower wires need longer; 8N1 is 10 bits, 7E2 is also 10.
+    def test_the_drain_scales_with_baud(self, fake_serial: _FakeSerialModule) -> None:
+        """A slower wire needs proportionally longer."""
+        t = _transport(timeout=1.0, baudrate=1200, bytesize=7, parity="E", stopbits=2)
+        t.open()
 
-        Pinning the computation rather than a constant, so a transport opened
-        for a non-default DIP configuration still waits the right time.
-        """
-        slow = _transport(timeout=1.0, baudrate=1200, bytesize=7, parity="E", stopbits=2)
-        slow.open()
-        started = time.monotonic()
-        slow.write_only(b"R2\r")
-        elapsed = time.monotonic() - started
+        elapsed = self._elapsed_write(t, b"R2\r")
 
-        expected = (3 + 2) * (10 / 1200)
-        assert elapsed >= expected * 0.9, (
+        expected = (3 + 2) * 11 / 1200
+        assert elapsed >= expected * self._SLEEP_FLOOR, (
             f"at 1200 baud the drain took {elapsed * 1000:.2f} ms, less than "
             f"the {expected * 1000:.2f} ms the wire needs"
+        )
+
+    @pytest.mark.parametrize("framing,bits", FRAMINGS)
+    def test_the_drain_matches_the_framings_character_time(
+        self,
+        fake_serial: _FakeSerialModule,
+        framing: dict[str, Any],
+        bits: int,
+    ) -> None:
+        """Each S2 DIP framing has its own character time, and the drain has
+        to track it.
+
+        7E2 is 11 bits and 8N1 is 10, so a drain that assumes one framing
+        under-waits the other by 9% - measured on the bench, an *exact* drain
+        was already scoring 1/60, so 9% short brings the corruption back.
+        """
+        t = _transport(timeout=1.0, baudrate=1200, **framing)
+        t.open()
+
+        elapsed = self._elapsed_write(t, b"R2\r")
+
+        expected = (3 + 2) * bits / 1200
+        assert elapsed >= expected * self._SLEEP_FLOOR, (
+            f"{framing} is {bits} bits/char; the drain took "
+            f"{elapsed * 1000:.2f} ms against the {expected * 1000:.2f} ms "
+            "the wire needs"
         )
 
     def test_request_may_reconfigure_because_it_does_so_before_writing(

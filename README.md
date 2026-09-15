@@ -328,24 +328,33 @@ did nothing or broke something. The `SerialTransport` tests separately verify
 every DIP-switch-documented reply terminator (CR, LF, CR+LF, LF+CR) plus
 timeout and error-wrapping behaviour.
 
-They also pin one invariant that is invisible in the bytes and easy to undo:
+They also pin one property that is invisible in the bytes and easy to undo:
 
-> **The port is never reconfigured between a write and the first reply byte.**
+> **A write does not return until its payload has clocked out of the UART.**
 
 On Windows, assigning `ser.timeout` is a port reconfiguration (pyserial's
-`_reconfigure_port` → `SetCommTimeouts`). Doing it while the command just
-written is still in the adapter's transmit FIFO corrupts it on the wire, and
-the instrument answers `INVALID COMMAND ENTRY` or `PARITY ERROR` to a command
-that left byte-perfect. It cost every setter — `SU1`, `Ufc`, `Rn`, `Z`,
-filter, AC/DC — a 20–90% failure rate on an FT4232H, and took streaming with
-them, while every getter stayed clean because `request()` sets its timeout
-*before* writing. macOS was unaffected, so it only appears on a Windows
-bench.
+`_reconfigure_port` → `SetCommTimeouts`). Every caller that writes and then
+reads — each setter, and the streaming start — sets the read timeout *after*
+its write, so without the drain that reconfiguration lands while the command
+is still in the adapter's transmit FIFO and corrupts it: the instrument
+answers `INVALID COMMAND ENTRY` or `PARITY ERROR` to a command that left
+byte-perfect.
 
-Reconfiguring *after* a reply byte is safe — the device answered, so nothing
-of ours is still in flight — which is why `request()` and the trailing-
-terminator peek may both still do it. Waiting for a *first* byte must poll
-instead: see `SerialTransport._wait_for_first_byte`.
+`flush()` does not cover it. It returns once the driver has the bytes, not
+once the UART has shifted them out, which is why the flush that has always
+been there never prevented this.
+
+It cost every setter — `SU1`, `Ufc`, `Rn`, `Z`, filter, AC/DC — a 20–90%
+failure rate on an FT4232H, and took streaming with it, while every getter
+stayed clean because `request()` sets its timeout *before* writing. macOS was
+unaffected, so it only shows on a Windows bench.
+
+The wait is computed from the configured baud and framing, not hard-coded:
+7E2 is 11 bits per character, 8N1 is 10, 7N1 is 9. The tests carry that
+table from first principles rather than recomputing it the way
+`SerialTransport._seconds_per_char` does, because a test that mirrors the
+code it checks cannot catch a wrong formula — and a drain 9% short is enough
+to bring the corruption back.
 
 Real-hardware smoke tests are manual — see
 [`examples/read_field.py`](examples/read_field.py),

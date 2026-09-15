@@ -340,8 +340,13 @@ class SerialTransport:
         """Wire time for one character at the configured framing.
 
         One start bit, the data bits, a parity bit when parity is enabled,
-        and the stop bits — 10 bits for the DTM-151-S default of 7E2, which
-        is ~1.04 ms at 9600 baud.
+        and the stop bits. For the DTM-151-S default of 7E2 that is
+        ``1 + 7 + 1 + 2 = 11`` bits, or ~1.15 ms at 9600 baud.
+
+        Computed rather than assumed, because the S2 DIP switches can select
+        other framings and each has its own character time: 8N1 is 10 bits,
+        8N2 is 11, 7N1 is 9. Under-drain a slower framing and the corruption
+        this exists to prevent comes back.
         """
         bits = 1 + self._bytesize + (0 if self._parity == "N" else 1) + self._stopbits
         return bits / float(self._baudrate)
