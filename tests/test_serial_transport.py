@@ -13,6 +13,7 @@ pyserial path without pyserial semantics leaking into the tests.
 from __future__ import annotations
 
 import sys
+import time
 import types
 from typing import Any
 
@@ -35,11 +36,10 @@ class _FakeSerial:
         self._timeout: float | None = kwargs.get("timeout")
         self.closed = False
         self.input_buffer_resets = 0
-        # Every assignment to .timeout, with how many bytes had been written
-        # at the time. On Windows each assignment is a port reconfiguration
-        # (pyserial's _reconfigure_port -> SetCommTimeouts), so *when* it
-        # happens is load-bearing - see
-        # test_read_optional_never_reconfigures_the_port.
+        # Every assignment to .timeout, with how many bytes had been
+        # written at the time. request() sets it *before* writing, which is
+        # safe and is why getters were unaffected while every setter failed
+        # on the same connection.
         self.timeout_writes: list[tuple[float | None, int]] = []
 
     @property
@@ -58,13 +58,10 @@ class _FakeSerial:
     def in_waiting(self) -> int:
         """Bytes readable without blocking, as ``serial.Serial`` reports them.
 
-        The double did without this for a long time because the only caller,
-        ``_drain_leading_terminators``, wrapped the access in a bare
-        ``except`` and treated the failure as "nothing buffered" — so the
-        fake silently exercised the error path in every test. ``read_optional``
-        now polls it to wait for the first byte without reconfiguring the
-        port, and a double that models the real API is what makes those tests
-        mean anything.
+        The double did without this for a long time because its only caller,
+        ``_drain_leading_terminators``, wraps the access in a bare ``except``
+        and treats the failure as "nothing buffered" — so every test using
+        the fake silently exercised that error path.
         """
         return len(self._rx_queue)
 
@@ -313,63 +310,153 @@ class TestReadReply:
 class TestReadOptional:
     """Cover the drain path used by Group3Protocol.send_setter()."""
 
-    def test_read_optional_never_reconfigures_the_port(
+    # Character times from first principles: one start bit, the data bits, a
+    # parity bit unless parity is disabled, then the stop bits. Written out
+    # per framing rather than recomputed from the implementation's formula -
+    # a test that mirrors the code it checks cannot catch a wrong formula,
+    # and getting this 9% low is enough to bring the corruption back.
+    # time.sleep() never returns early, so the measured drain can only be
+    # >= the computed one. The floor is 0.99 purely for clock granularity,
+    # not slack: an earlier 0.9 was wide enough to swallow the exact defect
+    # these tests exist to catch, since dropping 11 bits/char to 10 leaves
+    # 90.9% of the correct drain.
+    _SLEEP_FLOOR = 0.99
+
+    FRAMINGS = [
+        (dict(bytesize=7, parity="E", stopbits=2), 11),  # DTM-151-S default
+        (dict(bytesize=8, parity="N", stopbits=1), 10),
+        (dict(bytesize=8, parity="N", stopbits=2), 11),
+        (dict(bytesize=7, parity="N", stopbits=1), 9),
+    ]
+
+    @staticmethod
+    def _elapsed_write(t: SerialTransport, payload: bytes) -> float:
+        """Time a write with ``perf_counter``, not ``monotonic``.
+
+        These drains are single-digit milliseconds. On Windows under Python
+        3.10-3.12 ``monotonic`` is ``GetTickCount64`` at 15.6 ms resolution
+        (CPython moved it to ``QueryPerformanceCounter`` only in 3.13,
+        gh-88494), so a 5.67 ms drain can measure as 0.0 ms and fail a test
+        that is working perfectly. CI is Linux, so it would be invisible
+        there and would only bite on the Windows bench these tests exist
+        for.
+        """
+        started = time.perf_counter()
+        t.write_only(payload)
+        return time.perf_counter() - started
+
+    def test_write_only_waits_for_the_payload_to_clock_out(
         self, fake_serial: _FakeSerialModule
     ) -> None:
-        """Regression: assigning ``ser.timeout`` here corrupts the command.
+        """Regression: every setter failed 20-90% of the time on Windows.
 
-        ``read_optional`` is called immediately after ``write_only`` on the
-        setter path. On Windows, assigning ``ser.timeout`` reconfigures the
-        port (pyserial's ``_reconfigure_port`` -> ``SetCommTimeouts``), and
-        doing that while the command is still in the adapter's transmit FIFO
-        corrupts the bytes going out: the instrument receives garbage and
-        answers ``INVALID COMMAND ENTRY`` or ``PARITY ERROR``.
+        Callers that write and then read configure the read timeout *after*
+        the write. On Windows that assignment reconfigures the port
+        (pyserial's ``_reconfigure_port`` -> ``SetCommTimeouts``), and doing
+        it while the payload is still in the adapter's transmit FIFO corrupts
+        it: the instrument answers ``INVALID COMMAND ENTRY`` or ``PARITY
+        ERROR`` to a command that left byte-perfect.
 
-        Bench-measured on Windows over an FT4232H at 9600 7E2, ``R2`` sixty
-        times per configuration: write/settle/read scored 0/60 failures,
-        write/``ser.timeout = x``/settle/read scored 10/60 and 17/60. Through
-        the library it made every setter -- ``SU1``, ``Ufc``, ``Rn``, ``Z``,
-        filter, AC/DC -- fail between 20% and 90% of the time, and took
-        streaming with them, because ``stream_field`` sets its interval with
-        ``Kn``.
+        ``flush()`` does not cover this - it returns once the driver has the
+        bytes, not once the UART has shifted them out - which is why the
+        flush that has always been here did not prevent it.
 
-        ``request`` has always assigned ``ser.timeout`` *before* its write,
-        which is exactly why getters were unaffected on the same connection.
+        Bench-measured over an FT4232H at 9600 7E2, ``R2`` sixty times:
+        reconfiguring straight after the write scored 25/60 and 22/60
+        failures; draining first scored 0/60 twice.
 
-        The corruption happens inside the driver and cannot be seen in the
-        fake's bytes, so the guard is on the behaviour instead: wait for the
-        first byte by polling, never by reconfiguring.
+        Only the lower bound is asserted. Sleeping at least as long as the
+        wire needs is the property; sleeping longer is the scheduler.
+        """
+        t = _transport(timeout=1.0, baudrate=9600, bytesize=7, parity="E", stopbits=2)
+        t.open()
+
+        elapsed = self._elapsed_write(t, b"R2\r")
+
+        expected = (3 + 2) * 11 / 9600
+        assert elapsed >= expected * self._SLEEP_FLOOR, (
+            f"write_only returned after {elapsed * 1000:.2f} ms; the payload "
+            f"needs {expected * 1000:.2f} ms to clock out at 7E2/9600. "
+            "Reconfiguring the port this early corrupts the command."
+        )
+
+    def test_the_drain_scales_with_the_payload(
+        self, fake_serial: _FakeSerialModule
+    ) -> None:
+        """A longer command takes proportionally longer to leave the UART."""
+        t = _transport(timeout=1.0, baudrate=9600, bytesize=7, parity="E", stopbits=2)
+        t.open()
+
+        elapsed = self._elapsed_write(t, b"A" * 40 + b"\r")
+
+        expected = (41 + 2) * 11 / 9600
+        assert elapsed >= expected * self._SLEEP_FLOOR, (
+            f"a 41-character payload drained in {elapsed * 1000:.2f} ms, less "
+            f"than the {expected * 1000:.2f} ms it takes on the wire"
+        )
+
+    def test_the_drain_scales_with_baud(self, fake_serial: _FakeSerialModule) -> None:
+        """A slower wire needs proportionally longer."""
+        t = _transport(timeout=1.0, baudrate=1200, bytesize=7, parity="E", stopbits=2)
+        t.open()
+
+        elapsed = self._elapsed_write(t, b"R2\r")
+
+        expected = (3 + 2) * 11 / 1200
+        assert elapsed >= expected * self._SLEEP_FLOOR, (
+            f"at 1200 baud the drain took {elapsed * 1000:.2f} ms, less than "
+            f"the {expected * 1000:.2f} ms the wire needs"
+        )
+
+    @pytest.mark.parametrize("framing,bits", FRAMINGS)
+    def test_the_drain_matches_the_framings_character_time(
+        self,
+        fake_serial: _FakeSerialModule,
+        framing: dict[str, Any],
+        bits: int,
+    ) -> None:
+        """Each S2 DIP framing has its own character time, and the drain has
+        to track it.
+
+        7E2 is 11 bits and 8N1 is 10, so a drain that assumes one framing
+        under-waits the other by 9% - measured on the bench, an *exact* drain
+        was already scoring 1/60, so 9% short brings the corruption back.
+        """
+        t = _transport(timeout=1.0, baudrate=1200, **framing)
+        t.open()
+
+        elapsed = self._elapsed_write(t, b"R2\r")
+
+        expected = (3 + 2) * bits / 1200
+        assert elapsed >= expected * self._SLEEP_FLOOR, (
+            f"{framing} is {bits} bits/char; the drain took "
+            f"{elapsed * 1000:.2f} ms against the {expected * 1000:.2f} ms "
+            "the wire needs"
+        )
+
+    def test_request_may_reconfigure_because_it_does_so_before_writing(
+        self, fake_serial: _FakeSerialModule
+    ) -> None:
+        """The invariant is about ordering, not about never touching timeout.
+
+        ``request`` sets the timeout *before* its write, which is safe and is
+        exactly why getters were unaffected while every setter failed on the
+        same connection. Pinning it so a future change does not "fix" it into
+        the broken order.
         """
         t = _transport(timeout=1.0)
         t.open()
         ser = t._ser
-        ser.queue_rx(b"\n")
+        ser.queue_rx(b" 2\n\r\n")
         ser.timeout_writes.clear()
 
-        t.read_optional(0.05)
+        t.request(b"IR\r")
 
-        assert ser.timeout_writes == [], (
-            "read_optional reconfigured the port: "
-            f"{ser.timeout_writes!r}. Wait for the first byte by polling "
-            "in_waiting instead."
-        )
-
-    def test_write_only_then_read_optional_leaves_the_port_alone(
-        self, fake_serial: _FakeSerialModule
-    ) -> None:
-        """The real sequence a setter performs: write, then read the ack."""
-        t = _transport(timeout=1.0)
-        t.open()
-        ser = t._ser
-        ser.timeout_writes.clear()
-
-        t.write_only(b"R2\r")
-        ser.queue_rx(b"\n")
-        t.read_optional(0.05)
-
-        after_write = [w for w in ser.timeout_writes if w[1] > 0]
-        assert after_write == [], (
-            f"the port was reconfigured after the command went out: {after_write!r}"
+        assert ser.timeout_writes, "request is expected to set a timeout"
+        first = ser.timeout_writes[0]
+        assert first[1] == 0, (
+            f"request reconfigured after writing {first[1]} bytes; it must do "
+            "so before the write"
         )
 
     def test_no_bytes_returns_empty_within_timeout(
