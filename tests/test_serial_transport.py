@@ -13,6 +13,7 @@ pyserial path without pyserial semantics leaking into the tests.
 from __future__ import annotations
 
 import sys
+import time
 import types
 from typing import Any
 
@@ -333,69 +334,80 @@ class TestReadReply:
 class TestReadOptional:
     """Cover the drain path used by Group3Protocol.send_setter()."""
 
-    def test_read_optional_does_not_reconfigure_before_the_first_byte(
+    def test_write_only_waits_for_the_payload_to_clock_out(
         self, fake_serial: _FakeSerialModule
     ) -> None:
-        """Regression: reconfiguring here corrupts the command just written.
+        """Regression: every setter failed 20-90% of the time on Windows.
 
-        On Windows, assigning ``ser.timeout`` reconfigures the port
-        (pyserial's ``_reconfigure_port`` -> ``SetCommTimeouts``).
-        ``read_optional`` runs immediately after ``write_only`` on the setter
-        path, so a reconfiguration lands while the command is still in the
-        adapter's transmit FIFO and corrupts it: the instrument answers
-        ``INVALID COMMAND ENTRY`` or ``PARITY ERROR`` to a command that left
-        byte-perfect.
+        Callers that write and then read configure the read timeout *after*
+        the write. On Windows that assignment reconfigures the port
+        (pyserial's ``_reconfigure_port`` -> ``SetCommTimeouts``), and doing
+        it while the payload is still in the adapter's transmit FIFO corrupts
+        it: the instrument answers ``INVALID COMMAND ENTRY`` or ``PARITY
+        ERROR`` to a command that left byte-perfect.
 
-        Bench-measured over an FT4232H at 9600 7E2 - ``R2`` sixty times -
-        write/settle/read scored 0/60 failures against 10/60 and 17/60 for
-        write/``ser.timeout = x``/settle/read.
+        ``flush()`` does not cover this - it returns once the driver has the
+        bytes, not once the UART has shifted them out - which is why the
+        flush that has always been here did not prevent it.
 
-        The reply here is a full one, not a bare ack: an ack is consumed by
-        ``_drain_leading_terminators`` and returns early, which would let the
-        whole reply path go unexercised.
+        Bench-measured over an FT4232H at 9600 7E2, ``R2`` sixty times:
+        reconfiguring straight after the write scored 25/60 and 22/60
+        failures; draining first scored 0/60 twice.
+
+        Only the lower bound is asserted. Sleeping at least as long as the
+        wire needs is the property; sleeping a little longer is the scheduler
+        and not a defect.
         """
-        t = _transport(timeout=1.0)
+        t = _transport(timeout=1.0, baudrate=9600, bytesize=7, parity="E", stopbits=2)
         t.open()
-        ser = t._ser
+
+        started = time.monotonic()
         t.write_only(b"R2\r")
-        ser.queue_rx(b" OVER RAN\r\n")
-        ser.reply_after_polls(3)  # the device takes a moment to answer
-        ser.timeout_writes.clear()
+        elapsed = time.monotonic() - started
 
-        out = t.read_optional(0.05)
-
-        assert out == b" OVER RAN\r\n", "the reply path must actually run"
-        before_first_byte = [w for w in ser.timeout_writes if w[2] == 0]
-        assert before_first_byte == [], (
-            "the port was reconfigured before the first reply byte: "
-            f"{before_first_byte!r}"
+        # 7E2 = 10 bits/char at 9600 baud; 3 payload chars + the margin.
+        expected = (3 + 2) * (10 / 9600)
+        assert elapsed >= expected * 0.9, (
+            f"write_only returned after {elapsed * 1000:.2f} ms; the payload "
+            f"needs {expected * 1000:.2f} ms to clock out. Reconfiguring the "
+            "port this early corrupts the command."
         )
 
-    def test_read_reply_does_not_reconfigure_before_the_first_byte(
+    def test_the_drain_scales_with_the_payload(
         self, fake_serial: _FakeSerialModule
     ) -> None:
-        """Same window, the streaming path.
-
-        ``_start_auto_transmit`` sends ``SM1`` write-only and the first
-        streaming read lands in ``read_reply``, so it sits inside the same
-        post-write window. Missing this was why streaming still failed after
-        the first attempt at this fix.
-        """
-        t = _transport(timeout=1.0)
+        """A longer command takes proportionally longer to leave the UART."""
+        t = _transport(timeout=1.0, baudrate=9600, bytesize=7, parity="E", stopbits=2)
         t.open()
-        ser = t._ser
-        t.write_only(b"SM1\r")
-        ser.queue_rx(b" 0.71G\n\r")
-        ser.reply_after_polls(3)  # the device takes a moment to answer
-        ser.timeout_writes.clear()
 
-        out = t.read_reply(0.5)
+        started = time.monotonic()
+        t.write_only(b"A" * 40 + b"\r")
+        long_write = time.monotonic() - started
 
-        assert out == b" 0.71G\n\r", "the reply path must actually run"
-        before_first_byte = [w for w in ser.timeout_writes if w[2] == 0]
-        assert before_first_byte == [], (
-            "the port was reconfigured before the first reply byte: "
-            f"{before_first_byte!r}"
+        expected = (41 + 2) * (10 / 9600)
+        assert long_write >= expected * 0.9, (
+            f"a 41-character payload drained in {long_write * 1000:.2f} ms, "
+            f"less than the {expected * 1000:.2f} ms it takes on the wire"
+        )
+
+    def test_the_drain_scales_with_baud_and_framing(
+        self, fake_serial: _FakeSerialModule
+    ) -> None:
+        """Slower wires need longer; 8N1 is 10 bits, 7E2 is also 10.
+
+        Pinning the computation rather than a constant, so a transport opened
+        for a non-default DIP configuration still waits the right time.
+        """
+        slow = _transport(timeout=1.0, baudrate=1200, bytesize=7, parity="E", stopbits=2)
+        slow.open()
+        started = time.monotonic()
+        slow.write_only(b"R2\r")
+        elapsed = time.monotonic() - started
+
+        expected = (3 + 2) * (10 / 1200)
+        assert elapsed >= expected * 0.9, (
+            f"at 1200 baud the drain took {elapsed * 1000:.2f} ms, less than "
+            f"the {expected * 1000:.2f} ms the wire needs"
         )
 
     def test_request_may_reconfigure_because_it_does_so_before_writing(
