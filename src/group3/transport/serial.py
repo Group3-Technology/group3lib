@@ -49,6 +49,15 @@ _DRAIN_MARGIN_CHARS = 2
 #: ``time.sleep``, which on Windows has used a high-resolution waitable timer
 #: since Python 3.11 and so is *not* subject to the system tick that makes a
 #: blocking read round up.
+#:
+#: On Windows under Python 3.10 - still supported and still in the CI matrix -
+#: ``time.sleep`` *is* tick-rounded, so the first poll overshoots the whole
+#: window and the peek costs about what it cost before. That is a lost gain
+#: rather than a regression: the drain still never reconfigures the port, and
+#: every other platform and version honours the window precisely. Spinning
+#: instead would buy 3.10 the same gain at the price of a busy-wait on every
+#: request, three concurrently at three channels - not a trade worth making
+#: for one ageing version.
 _PEEK_POLL_SECONDS = 0.0005
 
 
@@ -244,7 +253,10 @@ class SerialTransport:
         so the OS rounds *any* sub-tick timeout up to a full tick. Measured on
         a DTM-351-S at 9600 7E2, that turned the 10 ms window into 15.9 ms of
         dead waiting **on every request**, more than doubling a 22 ms
-        exchange. Polling costs the same on POSIX, where the timeout was
+        exchange. See ``_PEEK_POLL_SECONDS`` for the one combination that
+        keeps the old cost (Windows on Python 3.10).
+
+        Polling costs the same on POSIX, where the timeout was
         already honoured precisely, and removes two ``ser.timeout``
         assignments per request — each one a ``SetCommTimeouts`` call that
         reconfigures the port mid-exchange, which is the hazard 0.4.2 exists
@@ -261,17 +273,30 @@ class SerialTransport:
         deadline = time.monotonic() + self._pair_peek_timeout
         while True:
             if not self._pushback and not self._buffered(ser):
-                # Nothing to read yet. Wait for it ourselves rather than
-                # handing the wait to the OS — see _wait_for_byte.
-                if time.monotonic() >= deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     return
-                time.sleep(_PEEK_POLL_SECONDS)
+                # Wait for the byte here rather than handing the wait to the
+                # OS, for the reason in this method's docstring.
+                time.sleep(min(_PEEK_POLL_SECONDS, remaining))
                 continue
+            # Only ever read a byte ``_buffered`` has already accounted for,
+            # exactly as ``_drain_leading_terminators`` does, so this read
+            # does not block on the caller's much longer ``ser.timeout``.
             peek = self._read_byte(ser)
             if not peek:
                 return
             if peek[0] in self._terminator_bytes:
                 buf.extend(peek)
+                # The budget is per byte, not for the drain as a whole. The
+                # implementation this replaces re-entered a blocking read with
+                # a fresh ``pair_peek_timeout`` after every terminator byte,
+                # and one shared deadline silently narrowed that: a three-byte
+                # terminator arriving in separate FTDI batches, each gap inside
+                # the window but the sum outside it, was truncated and left a
+                # terminator stranded for the next exchange to read as an
+                # empty reply.
+                deadline = time.monotonic() + self._pair_peek_timeout
                 continue
             # Non-terminator byte — out of the terminator zone. Restore
             # via pushback so the next read sees it.

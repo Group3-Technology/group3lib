@@ -12,6 +12,7 @@ pyserial path without pyserial semantics leaking into the tests.
 
 from __future__ import annotations
 
+import math
 import sys
 import threading
 import time
@@ -21,6 +22,7 @@ from typing import Any
 import pytest
 
 from group3 import SerialTransport, TimeoutError, TransportError
+from group3.transport import serial as serial_transport
 
 
 class _FakeSerial:
@@ -522,15 +524,80 @@ class TestTrailingTerminatorPeek:
 
         assert t.read_optional(timeout=0.5) == b" 1.03G\n\r\n"
 
-    def test_gives_up_after_the_window_not_a_multiple_of_it(
-        self, fake_serial: _FakeSerialModule
+    def test_budget_is_per_byte_not_for_the_whole_drain(
+        self, fake_serial: _FakeSerialModule, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A terminator that never arrives costs one window, once."""
-        window = 0.05
+        """Each terminator byte gets a fresh window, as it did before.
+
+        The implementation this replaces re-entered a blocking read with a
+        fresh ``pair_peek_timeout`` per byte. Collapsing that to one deadline
+        for the whole drain looks equivalent and is not: a three-byte
+        terminator delivered in separate FTDI batches, each gap inside the
+        window but the sum outside it, gets truncated and strands a byte that
+        the next exchange reads as an empty reply.
+
+        Driven by a controlled clock rather than real time. The obvious
+        version of this test used ``threading.Timer`` and was flaky 4 runs in
+        5 - ``Timer`` waits on ``Event.wait``, which on Windows is rounded up
+        to the 15.625 ms system tick, so a 20 ms timer fires anywhere up to
+        35 ms and lands outside the window it was meant to sit inside. That
+        is the same OS behaviour this whole change is about.
+        """
+        window = 0.030
+        clock = {"t": 0.0}
+        reveal = {0.020: b"\r", 0.040: b"\n"}
+
+        class _Clock:
+            @staticmethod
+            def monotonic() -> float:
+                return clock["t"]
+
+            @staticmethod
+            def sleep(seconds: float) -> None:
+                clock["t"] += max(seconds, 0.001)
+                for at, data in sorted(reveal.items()):
+                    if clock["t"] >= at and data is not None:
+                        ser.queue_rx(data)
+                        reveal[at] = None  # type: ignore[assignment]
+
+        monkeypatch.setattr(serial_transport, "time", _Clock)
+
         t = _transport(pair_peek_timeout=window)
         t.open()
         ser = fake_serial.last_instance
         assert ser is not None
+        ser.queue_rx(b" 1.03G\n")
+
+        # Gaps of 20 ms: each inside a 30 ms window, together outside it.
+        assert t.read_optional(timeout=0.5) == b" 1.03G\n\r\n"
+
+    def test_gives_up_after_the_window_not_a_multiple_of_it(
+        self, fake_serial: _FakeSerialModule
+    ) -> None:
+        """A terminator that never arrives costs one window, not one tick.
+
+        The fake is made to honour ``ser.timeout`` the way a Windows comm
+        timeout does — rounded up to the 15.625 ms system tick — because
+        otherwise this test's upper bound is decorative: the plain fake never
+        blocks, so a revert to OS-timeout waiting would trip the *lower*
+        bound and the upper one could not fail for the regression it names.
+        """
+        window = 0.05
+        tick = 0.015625
+        t = _transport(pair_peek_timeout=window)
+        t.open()
+        ser = fake_serial.last_instance
+        assert ser is not None
+
+        real_read = ser.read
+
+        def windows_read(n: int = 1) -> bytes:
+            if not ser.in_waiting and ser.timeout:
+                # What WaitForSingleObject does to a sub-tick comm timeout.
+                time.sleep(math.ceil(ser.timeout / tick) * tick)
+            return real_read(n)
+
+        ser.read = windows_read  # type: ignore[method-assign]
         ser.queue_rx(b" 1.03G\n")
 
         start = time.perf_counter()
@@ -539,11 +606,16 @@ class TestTrailingTerminatorPeek:
 
         # Lower bound: it really did wait, rather than returning at once.
         assert elapsed >= window * 0.9, f"returned after {elapsed * 1000:.1f} ms"
-        # The upper bound is the point of the fix. The old implementation
-        # paid ceil(window / 15.625 ms) * 15.625 ms on Windows; at a 50 ms
-        # window that is 62.5 ms. Generous slack, and still catches a
-        # regression to tick-rounded waiting.
-        assert elapsed < window * 1.6, f"took {elapsed * 1000:.1f} ms"
+        # Upper bound, stated as the thing it has to beat rather than as a
+        # round multiple: blocking on a comm timeout costs the window rounded
+        # up to a whole tick, 62.5 ms for a 50 ms window. A ratio picked by
+        # eye (1.6x = 80 ms) sits *above* that and so could not fail for the
+        # regression it names.
+        tick_rounded = math.ceil(window / tick) * tick
+        assert elapsed < tick_rounded * 0.95, (
+            f"took {elapsed * 1000:.1f} ms; tick-rounded waiting would cost "
+            f"{tick_rounded * 1000:.1f} ms"
+        )
 
     def test_never_reconfigures_the_port_mid_exchange(
         self, fake_serial: _FakeSerialModule
