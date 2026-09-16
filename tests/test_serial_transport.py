@@ -13,6 +13,7 @@ pyserial path without pyserial semantics leaking into the tests.
 from __future__ import annotations
 
 import sys
+import threading
 import time
 import types
 from typing import Any
@@ -486,6 +487,89 @@ class TestReadOptional:
         t.open()
         with pytest.raises(ValueError):
             t.read_optional(timeout=-0.1)
+
+
+class TestTrailingTerminatorPeek:
+    """The peek after a reply's first terminator byte.
+
+    It has to hold two things at once: pick up a paired terminator that is
+    still in flight, and not spend a fixed slab of wall-clock doing so. The
+    second is why this drain polls ``in_waiting`` instead of handing the wait
+    to ``ser.timeout`` - on Windows a comm timeout is rounded up to the
+    system tick (15.625 ms), so a 10 ms window cost 15.9 ms on *every*
+    request and more than doubled a 22 ms exchange.
+    """
+
+    def test_captures_a_terminator_still_in_flight(
+        self, fake_serial: _FakeSerialModule
+    ) -> None:
+        """A byte that has not arrived yet must still be drained.
+
+        The guard this replaces could not fail: the fake returns an empty
+        read the instant its queue runs dry, so no test ever made the peek
+        *wait* for anything, and an implementation that gave up at once
+        passed the whole suite.
+        """
+        t = _transport(pair_peek_timeout=0.2)
+        t.open()
+        ser = fake_serial.last_instance
+        assert ser is not None
+        ser.queue_rx(b" 1.03G\n")
+
+        # The rest of the terminator lands 5 ms later, as it would at 9600
+        # baud behind an FTDI latency timer.
+        threading.Timer(0.005, lambda: ser.queue_rx(b"\r\n")).start()
+
+        assert t.read_optional(timeout=0.5) == b" 1.03G\n\r\n"
+
+    def test_gives_up_after_the_window_not_a_multiple_of_it(
+        self, fake_serial: _FakeSerialModule
+    ) -> None:
+        """A terminator that never arrives costs one window, once."""
+        window = 0.05
+        t = _transport(pair_peek_timeout=window)
+        t.open()
+        ser = fake_serial.last_instance
+        assert ser is not None
+        ser.queue_rx(b" 1.03G\n")
+
+        start = time.perf_counter()
+        assert t.read_optional(timeout=0.5) == b" 1.03G\n"
+        elapsed = time.perf_counter() - start
+
+        # Lower bound: it really did wait, rather than returning at once.
+        assert elapsed >= window * 0.9, f"returned after {elapsed * 1000:.1f} ms"
+        # The upper bound is the point of the fix. The old implementation
+        # paid ceil(window / 15.625 ms) * 15.625 ms on Windows; at a 50 ms
+        # window that is 62.5 ms. Generous slack, and still catches a
+        # regression to tick-rounded waiting.
+        assert elapsed < window * 1.6, f"took {elapsed * 1000:.1f} ms"
+
+    def test_never_reconfigures_the_port_mid_exchange(
+        self, fake_serial: _FakeSerialModule
+    ) -> None:
+        """The drain must not assign ``ser.timeout``.
+
+        Two reasons, either sufficient. It is what makes the peek cost
+        sub-tick on Windows. And every assignment is a ``SetCommTimeouts``
+        on a port with a reply in flight, which is the exact hazard 0.4.2
+        exists to remove - see ``_await_drain``.
+        """
+        t = _transport(pair_peek_timeout=0.05)
+        t.open()
+        ser = fake_serial.last_instance
+        assert ser is not None
+        ser.queue_rx(b" 1.03G\n\r\n")
+
+        before = len(ser.timeout_writes)
+        assert t.request(b"F\r", timeout=0.5) == b" 1.03G\n\r\n"
+
+        # request() itself legitimately sets the timeout before writing and
+        # restores it afterwards. What must not appear is a third and fourth
+        # assignment from inside the drain.
+        assert len(ser.timeout_writes) - before <= 2, (
+            f"drain reconfigured the port: {ser.timeout_writes[before:]}"
+        )
 
 
 class TestRequestMechanics:

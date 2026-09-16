@@ -42,6 +42,15 @@ _DEFAULT_PAIR_PEEK_SECONDS = 0.01
 #: and driver jitter at negligible cost.
 _DRAIN_MARGIN_CHARS = 2
 
+#: How often ``_drain_trailing_terminators`` re-checks ``in_waiting`` while
+#: waiting out its peek window. Well under one character time at 9600 baud
+#: (1.146 ms at 7E2), so a byte in flight is picked up promptly, and short
+#: enough that the wait is bounded by the window rather than by this. Uses
+#: ``time.sleep``, which on Windows has used a high-resolution waitable timer
+#: since Python 3.11 and so is *not* subject to the system tick that makes a
+#: blocking read round up.
+_PEEK_POLL_SECONDS = 0.0005
+
 
 class SerialTransport:
     """Transport that talks to a DTM-151-S over RS-232 or fiber-optic-to-RS-232.
@@ -228,25 +237,58 @@ class SerialTransport:
         for streaming readings. Rather than encode each combination, drain
         all consecutive CR/LF bytes within the peek window. A non-terminator
         byte stops the drain and is push-back'd for the next read.
+
+        The peek window is honoured by polling ``in_waiting`` rather than by
+        setting ``ser.timeout`` and letting ``read`` block. On Windows a comm
+        timeout is enforced at the system timer tick — 15.625 ms by default —
+        so the OS rounds *any* sub-tick timeout up to a full tick. Measured on
+        a DTM-351-S at 9600 7E2, that turned the 10 ms window into 15.9 ms of
+        dead waiting **on every request**, more than doubling a 22 ms
+        exchange. Polling costs the same on POSIX, where the timeout was
+        already honoured precisely, and removes two ``ser.timeout``
+        assignments per request — each one a ``SetCommTimeouts`` call that
+        reconfigures the port mid-exchange, which is the hazard 0.4.2 exists
+        to avoid.
+
+        The window itself is deliberately unchanged. It is sized against the
+        FTDI latency timer, not the baud rate: with the 16 ms Windows default
+        the trailing bytes of a reply can be delivered a full latency period
+        after the first, and a window shorter than that would end the drain
+        early and leave terminator bytes to corrupt the next reply.
         """
         if self._pair_peek_timeout <= 0:
             return
-        saved = ser.timeout
-        ser.timeout = self._pair_peek_timeout
-        try:
-            while True:
-                peek = self._read_byte(ser)
-                if not peek:
+        deadline = time.monotonic() + self._pair_peek_timeout
+        while True:
+            if not self._pushback and not self._buffered(ser):
+                # Nothing to read yet. Wait for it ourselves rather than
+                # handing the wait to the OS — see _wait_for_byte.
+                if time.monotonic() >= deadline:
                     return
-                if peek[0] in self._terminator_bytes:
-                    buf.extend(peek)
-                    continue
-                # Non-terminator byte — out of the terminator zone. Restore
-                # via pushback so the next read sees it.
-                self._pushback = peek + self._pushback
+                time.sleep(_PEEK_POLL_SECONDS)
+                continue
+            peek = self._read_byte(ser)
+            if not peek:
                 return
-        finally:
-            ser.timeout = saved
+            if peek[0] in self._terminator_bytes:
+                buf.extend(peek)
+                continue
+            # Non-terminator byte — out of the terminator zone. Restore
+            # via pushback so the next read sees it.
+            self._pushback = peek + self._pushback
+            return
+
+    def _buffered(self, ser: _serial_types.Serial) -> int:
+        """Bytes already in the OS buffer, or 0 if that cannot be asked.
+
+        Defensive in the same way as ``_drain_leading_terminators``: a
+        transport that cannot report ``in_waiting`` degrades to "nothing
+        buffered", which makes the peek time out rather than misbehave.
+        """
+        try:
+            return int(ser.in_waiting)
+        except Exception:  # pragma: no cover - defensive
+            return 0
 
     def _drain_leading_terminators(self, ser: _serial_types.Serial) -> None:
         """Discard any leading terminator bytes from pushback + OS buffer.
