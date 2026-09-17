@@ -42,6 +42,31 @@ _DEFAULT_PAIR_PEEK_SECONDS = 0.01
 #: and driver jitter at negligible cost.
 _DRAIN_MARGIN_CHARS = 2
 
+#: How often ``_drain_trailing_terminators`` re-checks ``in_waiting`` while
+#: waiting out its peek window. Well under one character time at 9600 baud
+#: (1.146 ms at 7E2), so a byte in flight is picked up promptly, and short
+#: enough that the wait is bounded by the window rather than by this. Uses
+#: ``time.sleep``, which on Windows has used a high-resolution waitable timer
+#: since Python 3.11 and so is *not* subject to the system tick that makes a
+#: blocking read round up.
+#:
+#: On Windows under Python 3.10 - still supported and still in the CI matrix -
+#: ``time.sleep`` *is* tick-rounded, so the first poll overshoots the whole
+#: window and the peek costs about what it cost before. That is a lost gain
+#: rather than a regression: the drain still never reconfigures the port, and
+#: every other platform and version honours the window precisely. Spinning
+#: instead would buy 3.10 the same gain at the price of a busy-wait on every
+#: request, three concurrently at three channels - not a trade worth making
+#: for one ageing version.
+_PEEK_POLL_SECONDS = 0.0005
+
+#: Absolute ceiling on one trailing-terminator drain, however many bytes keep
+#: arriving. The per-byte window resets on every terminator, which is correct
+#: for a real multi-byte terminator and unbounded for a device stuck emitting
+#: CR/LF: ~1.15 ms per character at 9600 7E2 means this cap is thousands of
+#: bytes, unreachable in normal use and a bound in abnormal use.
+_PEEK_TOTAL_CAP_SECONDS = 1.0
+
 
 class SerialTransport:
     """Transport that talks to a DTM-151-S over RS-232 or fiber-optic-to-RS-232.
@@ -228,9 +253,98 @@ class SerialTransport:
         for streaming readings. Rather than encode each combination, drain
         all consecutive CR/LF bytes within the peek window. A non-terminator
         byte stops the drain and is push-back'd for the next read.
+
+        The peek window is honoured by polling ``in_waiting`` rather than by
+        setting ``ser.timeout`` and letting ``read`` block. On Windows a comm
+        timeout is enforced at the system timer tick — 15.625 ms by default —
+        so the OS rounds *any* sub-tick timeout up to a full tick. Measured on
+        a DTM-351-S at 9600 7E2, that turned the 10 ms window into 15.9 ms of
+        dead waiting **on every request**, more than doubling a 22 ms
+        exchange. See ``_PEEK_POLL_SECONDS`` for the one combination that
+        keeps the old cost (Windows on Python 3.10).
+
+        Polling costs the same on POSIX, where the timeout was
+        already honoured precisely, and removes two ``ser.timeout``
+        assignments per request — each one a ``SetCommTimeouts`` call that
+        reconfigures the port mid-exchange, which is the hazard 0.4.2 exists
+        to avoid.
+
+        The configured window is deliberately unchanged, but note that the
+        *effective* one on Windows has shrunk: tick rounding meant a 10 ms
+        setting really waited 15.9 ms, and it now waits 10 ms. Part of the
+        measured speed-up is therefore reduced tolerance, not purely reclaimed
+        dead time. That matters because the window's sizing criterion is the
+        FTDI latency timer rather than the baud rate — at the 16 ms Windows
+        default, a batch boundary falling between a reply's last data byte and
+        its trailing terminator separates them by a latency period, and a
+        window shorter than that ends the drain early. The 10 ms default has
+        always been under 16 ms on POSIX, so this is a pre-existing exposure
+        that Windows was accidentally papering over, not one introduced here —
+        but the honest reading is that the default is too small for a rig
+        running the stock latency timer, and raising it costs time on every
+        request. Left as a deliberate open question rather than changed here.
         """
         if self._pair_peek_timeout <= 0:
             return
+        deadline = time.monotonic() + self._pair_peek_timeout
+        # A device emitting CR/LF without pause would otherwise keep resetting
+        # the per-byte deadline and hold this loop — and ``buf`` — forever,
+        # past the caller's own timeout. One character is ~1.15 ms at 9600 7E2,
+        # so this cap is thousands of terminator bytes: unreachable for any
+        # real terminator, and a bound for a stuck one.
+        hard_stop = time.monotonic() + _PEEK_TOTAL_CAP_SECONDS
+        while True:
+            buffered = self._buffered(ser)
+            if buffered is None:
+                # This port cannot say what is buffered, so fall back to the
+                # blocking read the older implementation used throughout. It
+                # pays the OS timeout — tick-rounded on Windows — but it
+                # drains, which matters more than what it costs.
+                self._drain_trailing_blocking(ser, buf)
+                return
+            if not self._pushback and not buffered:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                # Wait for the byte here rather than handing the wait to the
+                # OS, for the reason in this method's docstring.
+                time.sleep(min(_PEEK_POLL_SECONDS, remaining))
+                continue
+            if time.monotonic() >= hard_stop:
+                return
+            # Only ever read a byte ``_buffered`` has already accounted for,
+            # exactly as ``_drain_leading_terminators`` does, so this read
+            # does not block on the caller's much longer ``ser.timeout``.
+            peek = self._read_byte(ser)
+            if not peek:
+                return
+            if peek[0] in self._terminator_bytes:
+                buf.extend(peek)
+                # The budget is per byte, not for the drain as a whole. The
+                # implementation this replaces re-entered a blocking read with
+                # a fresh ``pair_peek_timeout`` after every terminator byte,
+                # and one shared deadline silently narrowed that: a three-byte
+                # terminator arriving in separate FTDI batches, each gap inside
+                # the window but the sum outside it, was truncated and left a
+                # terminator stranded for the next exchange to read as an
+                # empty reply.
+                deadline = time.monotonic() + self._pair_peek_timeout
+                continue
+            # Non-terminator byte — out of the terminator zone. Restore
+            # via pushback so the next read sees it.
+            self._pushback = peek + self._pushback
+            return
+
+    def _drain_trailing_blocking(
+        self, ser: _serial_types.Serial, buf: bytearray
+    ) -> None:
+        """The pre-0.4.3 drain, kept for ports that cannot report ``in_waiting``.
+
+        Sets ``ser.timeout`` and lets ``read`` block, so on Windows it pays a
+        whole system tick per wait. That is the cost the polling path exists
+        to avoid, and it is the right trade here: a port that cannot be polled
+        would otherwise not be drained at all.
+        """
         saved = ser.timeout
         ser.timeout = self._pair_peek_timeout
         try:
@@ -241,12 +355,28 @@ class SerialTransport:
                 if peek[0] in self._terminator_bytes:
                     buf.extend(peek)
                     continue
-                # Non-terminator byte — out of the terminator zone. Restore
-                # via pushback so the next read sees it.
                 self._pushback = peek + self._pushback
                 return
         finally:
             ser.timeout = saved
+
+    def _buffered(self, ser: _serial_types.Serial) -> int | None:
+        """Bytes already in the OS buffer, or ``None`` if that cannot be asked.
+
+        ``None`` and ``0`` are deliberately different answers, and conflating
+        them is a bug this method was written with. The read below is *gated*
+        on this count, so reporting "nothing buffered" for a port that simply
+        cannot answer disables the drain altogether — it would burn the whole
+        window and consume nothing, reintroducing exactly the stranded
+        terminator residue this method exists to remove. The implementation
+        being replaced needed no ``in_waiting`` at all, so that would be a
+        regression rather than a defensive default. ``None`` instead sends the
+        caller down the blocking path, which still works.
+        """
+        try:
+            return int(ser.in_waiting)
+        except Exception:  # pragma: no cover - defensive
+            return None
 
     def _drain_leading_terminators(self, ser: _serial_types.Serial) -> None:
         """Discard any leading terminator bytes from pushback + OS buffer.

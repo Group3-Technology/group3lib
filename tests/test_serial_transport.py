@@ -12,7 +12,9 @@ pyserial path without pyserial semantics leaking into the tests.
 
 from __future__ import annotations
 
+import math
 import sys
+import threading
 import time
 import types
 from typing import Any
@@ -20,6 +22,7 @@ from typing import Any
 import pytest
 
 from group3 import SerialTransport, TimeoutError, TransportError
+from group3.transport import serial as serial_transport
 
 
 class _FakeSerial:
@@ -486,6 +489,195 @@ class TestReadOptional:
         t.open()
         with pytest.raises(ValueError):
             t.read_optional(timeout=-0.1)
+
+
+class TestTrailingTerminatorPeek:
+    """The peek after a reply's first terminator byte.
+
+    It has to hold two things at once: pick up a paired terminator that is
+    still in flight, and not spend a fixed slab of wall-clock doing so. The
+    second is why this drain polls ``in_waiting`` instead of handing the wait
+    to ``ser.timeout`` - on Windows a comm timeout is rounded up to the
+    system tick (15.625 ms), so a 10 ms window cost 15.9 ms on *every*
+    request and more than doubled a 22 ms exchange.
+    """
+
+    def test_captures_a_terminator_still_in_flight(
+        self, fake_serial: _FakeSerialModule
+    ) -> None:
+        """A byte that has not arrived yet must still be drained.
+
+        The guard this replaces could not fail: the fake returns an empty
+        read the instant its queue runs dry, so no test ever made the peek
+        *wait* for anything, and an implementation that gave up at once
+        passed the whole suite.
+        """
+        t = _transport(pair_peek_timeout=0.2)
+        t.open()
+        ser = fake_serial.last_instance
+        assert ser is not None
+        ser.queue_rx(b" 1.03G\n")
+
+        # The rest of the terminator lands 5 ms later, as it would at 9600
+        # baud behind an FTDI latency timer.
+        threading.Timer(0.005, lambda: ser.queue_rx(b"\r\n")).start()
+
+        assert t.read_optional(timeout=0.5) == b" 1.03G\n\r\n"
+
+    def test_budget_is_per_byte_not_for_the_whole_drain(
+        self, fake_serial: _FakeSerialModule, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Each terminator byte gets a fresh window, as it did before.
+
+        The implementation this replaces re-entered a blocking read with a
+        fresh ``pair_peek_timeout`` per byte. Collapsing that to one deadline
+        for the whole drain looks equivalent and is not: a three-byte
+        terminator delivered in separate FTDI batches, each gap inside the
+        window but the sum outside it, gets truncated and strands a byte that
+        the next exchange reads as an empty reply.
+
+        Driven by a controlled clock rather than real time. The obvious
+        version of this test used ``threading.Timer`` and was flaky 4 runs in
+        5 - ``Timer`` waits on ``Event.wait``, which on Windows is rounded up
+        to the 15.625 ms system tick, so a 20 ms timer fires anywhere up to
+        35 ms and lands outside the window it was meant to sit inside. That
+        is the same OS behaviour this whole change is about.
+        """
+        window = 0.030
+        clock = {"t": 0.0}
+        reveal = {0.020: b"\r", 0.040: b"\n"}
+
+        class _Clock:
+            @staticmethod
+            def monotonic() -> float:
+                return clock["t"]
+
+            @staticmethod
+            def sleep(seconds: float) -> None:
+                clock["t"] += max(seconds, 0.001)
+                for at, data in sorted(reveal.items()):
+                    if clock["t"] >= at and data is not None:
+                        ser.queue_rx(data)
+                        reveal[at] = None  # type: ignore[assignment]
+
+        monkeypatch.setattr(serial_transport, "time", _Clock)
+
+        t = _transport(pair_peek_timeout=window)
+        t.open()
+        ser = fake_serial.last_instance
+        assert ser is not None
+        ser.queue_rx(b" 1.03G\n")
+
+        # Gaps of 20 ms: each inside a 30 ms window, together outside it.
+        assert t.read_optional(timeout=0.5) == b" 1.03G\n\r\n"
+
+    def test_gives_up_after_the_window_not_a_multiple_of_it(
+        self, fake_serial: _FakeSerialModule
+    ) -> None:
+        """A terminator that never arrives costs one window, not one tick.
+
+        The fake is made to honour ``ser.timeout`` the way a Windows comm
+        timeout does — rounded up to the 15.625 ms system tick — because
+        otherwise this test's upper bound is decorative: the plain fake never
+        blocks, so a revert to OS-timeout waiting would trip the *lower*
+        bound and the upper one could not fail for the regression it names.
+        """
+        window = 0.05
+        tick = 0.015625
+        t = _transport(pair_peek_timeout=window)
+        t.open()
+        ser = fake_serial.last_instance
+        assert ser is not None
+
+        real_read = ser.read
+
+        def windows_read(n: int = 1) -> bytes:
+            if not ser.in_waiting and ser.timeout:
+                # What WaitForSingleObject does to a sub-tick comm timeout.
+                time.sleep(math.ceil(ser.timeout / tick) * tick)
+            return real_read(n)
+
+        ser.read = windows_read  # type: ignore[method-assign]
+        ser.queue_rx(b" 1.03G\n")
+
+        start = time.perf_counter()
+        assert t.read_optional(timeout=0.5) == b" 1.03G\n"
+        elapsed = time.perf_counter() - start
+
+        # Lower bound: it really did wait, rather than returning at once.
+        assert elapsed >= window * 0.9, f"returned after {elapsed * 1000:.1f} ms"
+        # Upper bound, stated as the thing it has to beat rather than as a
+        # round multiple: blocking on a comm timeout costs the window rounded
+        # up to a whole tick, 62.5 ms for a 50 ms window. A ratio picked by
+        # eye (1.6x = 80 ms) sits *above* that and so could not fail for the
+        # regression it names.
+        tick_rounded = math.ceil(window / tick) * tick
+        if sys.platform == "win32" and sys.version_info < (3, 11):
+            # There is nothing to assert here. ``time.sleep`` only became
+            # high-resolution on Windows in 3.11, so on 3.10 the poll loop is
+            # tick-rounded too and lands on the same ~62.5 ms the blocking
+            # implementation cost. _PEEK_POLL_SECONDS says so; asserting the
+            # opposite would fail a correct implementation, and CI is Linux so
+            # nothing would have caught it.
+            pytest.skip("time.sleep is tick-rounded on Windows before 3.11")
+        assert elapsed < tick_rounded * 0.95, (
+            f"took {elapsed * 1000:.1f} ms; tick-rounded waiting would cost "
+            f"{tick_rounded * 1000:.1f} ms"
+        )
+
+    def test_still_drains_when_in_waiting_cannot_be_read(
+        self, fake_serial: _FakeSerialModule, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A port that cannot report ``in_waiting`` must still be drained.
+
+        The read is gated on the buffered count, so answering "0 bytes" for a
+        port that simply cannot say disables the drain entirely: it burns the
+        window and consumes nothing, stranding exactly the terminator residue
+        this method exists to remove. The implementation being replaced needed
+        no ``in_waiting`` at all, so that would be a regression rather than a
+        safe default. ``None`` routes to the blocking fallback instead.
+        """
+        t = _transport(pair_peek_timeout=0.05)
+        t.open()
+        ser = fake_serial.last_instance
+        assert ser is not None
+
+        def unavailable(_self: object) -> int:
+            raise OSError("this port cannot report in_waiting")
+
+        # setattr on the class, via monkeypatch so the real property comes
+        # back afterwards - deleting it would strip the fake permanently and
+        # take every other test in the file with it.
+        monkeypatch.setattr(type(ser), "in_waiting", property(unavailable))
+
+        ser.queue_rx(b" 1.03G\n\r\n")
+        assert t.read_optional(timeout=0.5) == b" 1.03G\n\r\n"
+
+    def test_never_reconfigures_the_port_mid_exchange(
+        self, fake_serial: _FakeSerialModule
+    ) -> None:
+        """The drain must not assign ``ser.timeout``.
+
+        Two reasons, either sufficient. It is what makes the peek cost
+        sub-tick on Windows. And every assignment is a ``SetCommTimeouts``
+        on a port with a reply in flight, which is the exact hazard 0.4.2
+        exists to remove - see ``_await_drain``.
+        """
+        t = _transport(pair_peek_timeout=0.05)
+        t.open()
+        ser = fake_serial.last_instance
+        assert ser is not None
+        ser.queue_rx(b" 1.03G\n\r\n")
+
+        before = len(ser.timeout_writes)
+        assert t.request(b"F\r", timeout=0.5) == b" 1.03G\n\r\n"
+
+        # request() itself legitimately sets the timeout before writing and
+        # restores it afterwards. What must not appear is a third and fourth
+        # assignment from inside the drain.
+        assert len(ser.timeout_writes) - before <= 2, (
+            f"drain reconfigured the port: {ser.timeout_writes[before:]}"
+        )
 
 
 class TestRequestMechanics:
