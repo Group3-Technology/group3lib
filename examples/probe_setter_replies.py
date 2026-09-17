@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from typing import Any, TypeVar
 
 from group3 import (
@@ -92,31 +93,18 @@ def _attempt(fn: Callable[[], _T]) -> _T | None:
         return None
 
 
+@dataclass
 class _DeviceState:
     """What the sweep disturbs and the device can report back.
 
     The digital filter is absent deliberately: ``D0``/``D1`` have no query,
     so there is nothing to record and nothing to restore.
-
-    A plain class rather than a dataclass. ``tests/test_examples_smoke.py``
-    loads each example with ``exec_module`` without registering it in
-    ``sys.modules``, and ``@dataclass`` under ``from __future__ import
-    annotations`` has to look the module up there to resolve its string
-    annotations — so it raises on import and takes the smoke test with it.
-    No other example needs one either.
     """
 
-    def __init__(
-        self,
-        range_index: int | None,
-        measurement: MeasurementMode | None,
-        acquisition: AcquisitionMode | None,
-        send_units: bool | None,
-    ) -> None:
-        self.range_index = range_index
-        self.measurement = measurement
-        self.acquisition = acquisition
-        self.send_units = send_units
+    range_index: int | None
+    measurement: MeasurementMode | None
+    acquisition: AcquisitionMode | None
+    send_units: bool | None
 
     def describe(self) -> str:
         unknown = "?"

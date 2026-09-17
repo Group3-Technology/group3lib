@@ -18,11 +18,13 @@ No real serial port is touched (see ``.claude/rules/testing-with-faketransport.m
 
 from __future__ import annotations
 
+import importlib.machinery
 import importlib.util
 import sys
 import types
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import pytest
 
@@ -133,11 +135,35 @@ def loop_serial_with_echo(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
 
 
 def _load(name: str) -> Any:
-    """Import an example script by path (``examples/`` is not a package)."""
+    """Import an example script by path (``examples/`` is not a package).
+
+    The module is registered in ``sys.modules`` *before* it is executed, and
+    removed afterwards. Executing it unregistered looks equivalent and is not:
+    anything that resolves its own module at class-creation time fails, and
+    the failure surfaces as an unrelated-looking error from deep inside the
+    stdlib. ``@dataclass`` under ``from __future__ import annotations`` is the
+    case that found this — it looks itself up in ``sys.modules`` to turn its
+    string annotations back into types, and raised ``'NoneType' object has no
+    attribute '__dict__'`` from ``dataclasses.py``. ``typing.get_type_hints``,
+    pickling and ``super()`` in some forms need it for the same reason.
+
+    The entry is left in place on success, deliberately. The module object
+    outlives this call — callers hold it and invoke its functions — and
+    anything resolving the module lazily (``get_type_hints`` at call time,
+    say) would then fail exactly as it did at import time. A later ``_load``
+    of the same example simply replaces the entry. It is removed only when
+    execution raises, so a half-initialised module is never left for another
+    test to import.
+    """
     spec = importlib.util.spec_from_file_location(f"_example_{name}", EXAMPLES / f"{name}.py")
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        del sys.modules[spec.name]
+        raise
     return module
 
 
@@ -150,6 +176,60 @@ ALL_EXAMPLES = [
     "live_plot",  # imports matplotlib lazily, so --help works without the extra
     "probe_setter_replies",
 ]
+
+
+class TestExampleLoader:
+    """The loader is test scaffolding, but examples are written against it."""
+
+    @pytest.mark.parametrize("name", ALL_EXAMPLES)
+    def test_module_is_registered_while_executing(self, name: str) -> None:
+        """An example must be able to find itself in ``sys.modules`` on import.
+
+        Without this, any example using ``@dataclass`` (or anything else that
+        resolves its own module at class-creation time) fails to import, with
+        an error pointing at the stdlib rather than at the loader. Asserting
+        the registration directly says what the requirement is; asserting only
+        that the examples happen to import would pass again the moment someone
+        removed the last dataclass.
+        """
+        recorded: list[bool] = []
+        real_exec = importlib.machinery.SourceFileLoader.exec_module
+
+        def spy(self: Any, module: Any) -> None:
+            recorded.append(sys.modules.get(module.__name__) is module)
+            real_exec(self, module)
+
+        with mock.patch.object(
+            importlib.machinery.SourceFileLoader, "exec_module", spy
+        ):
+            _load(name)
+        assert recorded == [True], (
+            f"{name} was executed without being registered in sys.modules"
+        )
+
+    def test_failed_import_leaves_nothing_registered(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A module that raises while executing must not stay in ``sys.modules``.
+
+        Otherwise the next import of that name gets a half-initialised module
+        back instead of re-running it, and the resulting failure points
+        anywhere but here.
+
+        This replaces a guard that could not fail. It asserted that
+        ``_load("read_field")`` left nothing new in ``sys.modules``, but
+        earlier tests in the file load that example first, so the name was
+        already present and the set difference was empty whatever the loader
+        did — and the loader does keep successful imports registered anyway,
+        so the guard was asserting the opposite of the intended behaviour.
+        """
+        broken = tmp_path / "kaboom.py"
+        broken.write_text("raise RuntimeError('deliberate')\n", encoding="utf-8")
+        monkeypatch.setitem(globals(), "EXAMPLES", tmp_path)
+
+        with pytest.raises(RuntimeError, match="deliberate"):
+            _load("kaboom")
+        assert "_example_kaboom" not in sys.modules
 
 
 class TestExampleArguments:
