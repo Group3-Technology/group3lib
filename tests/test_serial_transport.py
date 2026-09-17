@@ -612,10 +612,46 @@ class TestTrailingTerminatorPeek:
         # eye (1.6x = 80 ms) sits *above* that and so could not fail for the
         # regression it names.
         tick_rounded = math.ceil(window / tick) * tick
+        if sys.platform == "win32" and sys.version_info < (3, 11):
+            # There is nothing to assert here. ``time.sleep`` only became
+            # high-resolution on Windows in 3.11, so on 3.10 the poll loop is
+            # tick-rounded too and lands on the same ~62.5 ms the blocking
+            # implementation cost. _PEEK_POLL_SECONDS says so; asserting the
+            # opposite would fail a correct implementation, and CI is Linux so
+            # nothing would have caught it.
+            pytest.skip("time.sleep is tick-rounded on Windows before 3.11")
         assert elapsed < tick_rounded * 0.95, (
             f"took {elapsed * 1000:.1f} ms; tick-rounded waiting would cost "
             f"{tick_rounded * 1000:.1f} ms"
         )
+
+    def test_still_drains_when_in_waiting_cannot_be_read(
+        self, fake_serial: _FakeSerialModule, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A port that cannot report ``in_waiting`` must still be drained.
+
+        The read is gated on the buffered count, so answering "0 bytes" for a
+        port that simply cannot say disables the drain entirely: it burns the
+        window and consumes nothing, stranding exactly the terminator residue
+        this method exists to remove. The implementation being replaced needed
+        no ``in_waiting`` at all, so that would be a regression rather than a
+        safe default. ``None`` routes to the blocking fallback instead.
+        """
+        t = _transport(pair_peek_timeout=0.05)
+        t.open()
+        ser = fake_serial.last_instance
+        assert ser is not None
+
+        def unavailable(_self: object) -> int:
+            raise OSError("this port cannot report in_waiting")
+
+        # setattr on the class, via monkeypatch so the real property comes
+        # back afterwards - deleting it would strip the fake permanently and
+        # take every other test in the file with it.
+        monkeypatch.setattr(type(ser), "in_waiting", property(unavailable))
+
+        ser.queue_rx(b" 1.03G\n\r\n")
+        assert t.read_optional(timeout=0.5) == b" 1.03G\n\r\n"
 
     def test_never_reconfigures_the_port_mid_exchange(
         self, fake_serial: _FakeSerialModule
