@@ -23,10 +23,19 @@ every reading, a device in AC mode came back in DC, and the range sweep ended
 on ``R3`` with no restore at all, so a device on range 0 was left on 3.0 T.
 All three observed on the bench.
 
-One piece of state cannot be honoured: the digital filter. ``D0``/``D1`` have
-no corresponding query, so the device cannot be asked what it was and the
-sweep leaves the filter OFF. That is reported at the end rather than papered
-over.
+Every setting the sweep touches is read back and restored, including the
+digital filter — ``D0``/``D1`` are answered by ``ID``
+(:meth:`DTM151Serial.get_filter_enabled`).
+
+Send-units is the one that cannot always be pinned down, because it has no
+query of its own. Its only observable is whether a reading carries a unit
+suffix, and a suffix appears when DIP S2-6 is set *or* ``SU1`` is active. So a
+suffix seen before the sweep does not by itself mean ``SU1``. The sweep ends
+on ``SU0``, which makes the two distinguishable after the fact: if the suffix
+disappears, ``SU1`` was supplying it and is restored; if it survives, S2-6 is
+supplying it and the ``SU`` register's prior value is genuinely unknowable.
+That last case is reported rather than guessed at — issuing ``SU1`` on a
+hunch would change state on exactly the devices this is trying to protect.
 """
 
 from __future__ import annotations
@@ -104,35 +113,51 @@ class _DeviceState:
     range_index: int | None
     measurement: MeasurementMode | None
     acquisition: AcquisitionMode | None
-    send_units: bool | None
+    filter_enabled: bool | None
+    #: Whether a reading carried a unit suffix. Deliberately not named
+    #: ``send_units``: the suffix can come from DIP S2-6 instead, so this
+    #: records the observable, not the inference drawn from it.
+    has_unit_suffix: bool | None
 
     def describe(self) -> str:
         unknown = "?"
+
+        def flag(value: bool | None) -> str:
+            return unknown if value is None else ("on" if value else "off")
+
         rng = self.range_index if self.range_index is not None else unknown
         meas = self.measurement.name if self.measurement else unknown
         acq = self.acquisition.name if self.acquisition else unknown
-        units = unknown if self.send_units is None else (
-            "on" if self.send_units else "off"
+        return (
+            f"range={rng}  mode={meas}/{acq}  "
+            f"filter={flag(self.filter_enabled)}  "
+            f"suffix={flag(self.has_unit_suffix)}"
         )
-        return f"range={rng}  mode={meas}/{acq}  units={units}"
 
 
 def _snapshot(dtm: DTM151Serial) -> _DeviceState:
     """Read back everything the sweep will disturb."""
     status = _attempt(dtm.get_status)
-    # No query exists for SU. Infer it from whether a reading carries a unit
-    # suffix, which is the only observable that setting has.
     reading = _attempt(dtm.read_field)
     return _DeviceState(
         range_index=_attempt(dtm.get_range),
         measurement=status.measurement if status else None,
         acquisition=status.acquisition if status else None,
-        send_units=(reading.unit is not Unit.UNKNOWN) if reading else None,
+        filter_enabled=_attempt(dtm.get_filter_enabled),
+        has_unit_suffix=(reading.unit is not Unit.UNKNOWN) if reading else None,
     )
 
 
 def _restore(dtm: DTM151Serial, before: _DeviceState) -> list[str]:
-    """Put back what was recorded. Returns one report line per action."""
+    """Put back what was recorded. Returns one report line per field.
+
+    Every field gets a line, including the ones that cannot be restored. A
+    silent skip is the failure mode this whole function exists to remove: if
+    ``F`` answered ``NO PROBE`` during the snapshot, or ``IR`` timed out, the
+    device is left on whatever the sweep last set — ``R3``, i.e. 3.0 T — and
+    saying nothing about it reproduces the original bug while looking like it
+    has been fixed.
+    """
     actions: list[str] = []
 
     def do(label: str, fn: Callable[[], Any]) -> None:
@@ -142,26 +167,74 @@ def _restore(dtm: DTM151Serial, before: _DeviceState) -> list[str]:
         except Exception as exc:
             actions.append(f"  FAILED to restore {label}: {type(exc).__name__}")
 
+    def unreadable(label: str, left_at: str) -> None:
+        actions.append(
+            f"  NOT RESTORED {label} - could not be read before the sweep; "
+            f"left at {left_at}"
+        )
+
     if before.range_index is not None:
         target = before.range_index
         do(f"range={target}", lambda: dtm.set_range(target))
+    else:
+        unreadable("range", "R3 (3.0 T)")
+
     if before.measurement is MeasurementMode.AC:
         do("AC mode", dtm.set_ac_mode)
     elif before.measurement is MeasurementMode.DC:
         do("DC mode", dtm.set_dc_mode)
+    else:
+        unreadable("measurement mode", "DC")
+
     if before.acquisition is AcquisitionMode.TRIGGERED:
         do("triggered acquisition", dtm.set_triggered_mode)
     elif before.acquisition is AcquisitionMode.CONTINUOUS:
         do("continuous acquisition", dtm.set_continuous_mode)
-    if before.send_units is not None:
-        want = bool(before.send_units)
-        do("send-units=" + ("on" if want else "off"),
-           lambda: dtm.set_send_units(want))
-    actions.append(
-        "  digital filter left OFF - D0/D1 have no query, so its prior "
-        "state could not be read"
-    )
+    else:
+        unreadable("acquisition mode", "continuous")
+
+    if before.filter_enabled is not None:
+        want_filter = before.filter_enabled
+        do("filter=" + ("on" if want_filter else "off"),
+           lambda: dtm.set_filter_enabled(want_filter))
+    else:
+        unreadable("digital filter", "off")
+
+    actions.extend(_restore_send_units(dtm, before))
     return actions
+
+
+def _restore_send_units(dtm: DTM151Serial, before: _DeviceState) -> list[str]:
+    """Restore ``SU`` using the only evidence there is: the suffix, twice.
+
+    ``SU`` has no query, and a unit suffix can come from DIP S2-6 as well as
+    from ``SU1``, so the snapshot alone cannot tell them apart. The sweep ends
+    on ``SU0``, which does: read the suffix again now and compare.
+
+    - suffix before, none now -> ``SU1`` was supplying it. Restore it.
+    - suffix before and still now -> S2-6 supplies it; ``SU``'s prior value is
+      unknowable and does not affect what the device emits. Say so.
+    - no suffix before -> ``SU`` was already off. Nothing to do.
+    """
+    if before.has_unit_suffix is None:
+        return ["  NOT RESTORED send-units - no reading before the sweep; "
+                "left at SU0"]
+    if not before.has_unit_suffix:
+        return ["  send-units already off before the sweep; left at SU0"]
+
+    now = _attempt(dtm.read_field)
+    if now is None:
+        return ["  NOT RESTORED send-units - no reading available; left at SU0"]
+    if now.unit is not Unit.UNKNOWN:
+        return ["  send-units not restorable - the suffix survives SU0, so it "
+                "comes from DIP S2-6 and SU's prior value cannot be known; "
+                "left at SU0 with the suffix intact"]
+    try:
+        dtm.set_send_units(True)
+    except Exception as exc:
+        return [f"  FAILED to restore send-units=on: {type(exc).__name__}"]
+    return ["  restored send-units=on (the suffix vanished under SU0, so SU1 "
+            "was supplying it)"]
 
 
 def _probe(
