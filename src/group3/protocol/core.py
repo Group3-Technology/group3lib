@@ -39,7 +39,7 @@ def _echo_prefix(payload: bytes, terminator: bytes) -> bytes:
     reply (see :attr:`Group3Protocol.expect_command_returned`), and the
     prefix differs slightly between them:
 
-    * **S2-4 echo.** Verified on bench unit FT572EW5 (2026-05-09): the
+    * **S2-4 echo.** Verified on a bench unit (2026-05-09): the
       firmware echoes the printable command body but suppresses the
       host-side CR terminator that triggered command processing.
     * **G3CL loop ripple.** The command is retransmitted around the loop
@@ -278,8 +278,8 @@ class Group3Protocol:
 
         if self.expect_command_returned:
             # The command comes back ahead of its reply — echoed by the device
-            # (printable body only, terminator suppressed; verified on bench
-            # unit FT572EW5 on 2026-05-09) or rippled around the G3CL loop
+            # (printable body only, terminator suppressed; verified on a bench
+            # unit on 2026-05-09) or rippled around the G3CL loop
             # (byte-for-byte, terminator included).
             echo_prefix = _echo_prefix(payload, self.terminator)
             if not raw.startswith(echo_prefix):
@@ -372,7 +372,7 @@ class Group3Protocol:
         if self.expect_command_returned and echo_command is not None and raw:
             # The caller just wrote ``echo_command`` via send_no_reply; the
             # device echoed its printable body (terminator suppressed —
-            # verified on bench unit FT572EW5). Strip that echo before
+            # verified on a bench unit). Strip that echo before
             # checking for an error or unexpected reply.
             payload = codec.encode(echo_command, self.terminator)
             echo_prefix = _echo_prefix(payload, self.terminator)

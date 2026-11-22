@@ -554,7 +554,7 @@ class TestIdentify:
     ) -> None:
         # Device echoes Ctrl-D (control byte echoed verbatim), replies;
         # echoes Ctrl-B, replies; echoes SE0 (printable body only — the
-        # CR terminator is suppressed per bench observation FT572EW5),
+        # CR terminator is suppressed per bench observation),
         # then acks with bare LF. identify() re-probes with Ctrl-B, which
         # now comes back unechoed, confirming echo really is off.
         fake.scripted(
@@ -628,7 +628,7 @@ class TestIdentify:
     def test_bench_unit_dip_reply_with_nibble_spaces_parses(
         self, dtm: DTM151Serial, fake: FakeTransport
     ) -> None:
-        # Verbatim reply from FT572EW5 on 2026-05-09.
+        # Verbatim reply from a bench unit on 2026-05-09.
         bench_reply = b" 0101 0110 0000 0000 \n\r"
         fake.scripted(
             [
@@ -652,7 +652,7 @@ class TestEchoAwareSend:
     ) -> None:
         """Echo (printable body, terminator suppressed) and reply merged in one read.
 
-        Bench-verified on FT572EW5 (2026-05-09): the device echoes ``F`` (no
+        Bench-verified (2026-05-09): the device echoes ``F`` (no
         ``\\r``) then immediately the reply ` 1.713G` then the terminator pair.
         """
         protocol.expect_command_returned = True

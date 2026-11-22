@@ -260,7 +260,7 @@ def parse_dip_switches(reply: str) -> DipSwitches:
     space (manual section 4.5.2); this parser tolerates an optional leading
     space and requires exactly 16 ``0``/``1`` characters.
 
-    Verified against bench unit FT572EW5 on 2026-05-09:
+    Verified against a bench unit on 2026-05-09:
     the firmware formats the reply as ``" 0101 0110 0000 0000 \\n\\r"`` —
     four space-separated 4-bit nibbles plus a trailing space — so this
     parser strips **all** whitespace, not just leading/trailing. Bit

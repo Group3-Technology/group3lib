@@ -244,7 +244,7 @@ class TestParseDipSwitches:
         assert dip.units_gauss is False
 
     def test_bench_unit_reply_format_with_nibble_spaces(self) -> None:
-        # Verbatim reply from FT572EW5 on 2026-05-09: four space-separated
+        # Verbatim reply from a bench unit on 2026-05-09: four space-separated
         # 4-bit nibbles. Cross-checked bits: S2-2 (CR), S2-3 (double term),
         # S2-5 (gauss), S2-7 (filter ON) — all ON; everything else OFF.
         dip = parse_dip_switches(" 0101 0110 0000 0000 ")
