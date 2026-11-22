@@ -6,6 +6,7 @@ import pytest
 
 from group3.exceptions import (
     DeviceOverflowError,
+    DeviceRestartedError,
     FixedRangeProbeError,
     InvalidCommandError,
     NoProbeError,
@@ -15,6 +16,7 @@ from group3.exceptions import (
 )
 from group3.protocol.parser import (
     check_error,
+    check_restarted,
     parse_baud_code,
     parse_bool_flag,
     parse_dip_switches,
@@ -123,6 +125,42 @@ class TestParseReading:
     def test_rejects_malformed(self) -> None:
         with pytest.raises(ProtocolError):
             parse_reading(" garbage")
+
+
+class TestRestartBanner:
+    """The boot banner anywhere in a reply means the instrument restarted."""
+
+    def test_banner_raises_restarted(self) -> None:
+        with pytest.raises(DeviceRestartedError) as excinfo:
+            check_restarted(" GROUP 3 DTMS  7.10")
+        assert excinfo.value.raw == b" GROUP 3 DTMS  7.10"
+
+    def test_truncated_reply_ahead_of_banner_raises_restarted(self) -> None:
+        with pytest.raises(DeviceRestartedError):
+            check_restarted(" -0 GROUP 3 DTMS  7.10")
+
+    def test_banner_without_space_or_uppercase_raises_restarted(self) -> None:
+        with pytest.raises(DeviceRestartedError):
+            check_restarted(" Group3 DTMS 7.10")
+
+    def test_banner_without_any_space_raises_restarted(self) -> None:
+        with pytest.raises(DeviceRestartedError):
+            check_restarted(" GROUP3DTMS 7.11")
+
+    def test_attaches_given_raw(self) -> None:
+        with pytest.raises(DeviceRestartedError) as excinfo:
+            check_restarted(" GROUP 3 DTMS  7.10", raw=b" GROUP 3 DTMS  7.10\r")
+        assert excinfo.value.raw == b" GROUP 3 DTMS  7.10\r"
+
+    def test_restarted_is_a_protocol_error(self) -> None:
+        assert issubclass(DeviceRestartedError, ProtocolError)
+
+    def test_junk_is_not_restarted(self) -> None:
+        check_restarted(" garbage")  # must not raise
+        check_restarted(" DTMS")  # must not raise
+
+    def test_reading_is_not_restarted(self) -> None:
+        check_restarted(" 1.2345T")  # must not raise
 
 
 class TestParseStatus:

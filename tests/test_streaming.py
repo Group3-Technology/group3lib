@@ -6,6 +6,7 @@ import pytest
 
 from group3 import (
     CommandError,
+    DeviceRestartedError,
     DTM151Serial,
     FakeTransport,
     FieldStream,
@@ -237,6 +238,19 @@ class TestStreamField:
             with pytest.raises(NoProbeError):
                 next(it)
         assert values == [pytest.approx(0.10)]
+
+    def test_banner_during_stream_raises_restarted(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        """A restart mid-stream surfaces as DeviceRestartedError, not noise."""
+        fake.queue_reply(b" 0.10T\r")
+        fake.queue_reply(b" GROUP 3 DTMS  7.10\r")
+        with dtm.stream_field() as stream:
+            it = iter(stream)
+            assert next(it).value == pytest.approx(0.10)
+            with pytest.raises(DeviceRestartedError):
+                next(it)
+        assert fake.sent == [SENT_SM1, SENT_SM0]
 
     def test_drain_absorbs_inflight_replies_on_exit(
         self, dtm: DTM151Serial, fake: FakeTransport

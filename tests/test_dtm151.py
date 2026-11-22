@@ -15,6 +15,7 @@ from group3 import (
     CommandError,
     DeviceMetadataSnapshot,
     DeviceProfile,
+    DeviceRestartedError,
     DTM151Serial,
     FakeTransport,
     FixedRangeProbeError,
@@ -65,6 +66,9 @@ SENT_A5 = b"A5\r"
 SENT_SC_2 = b"SC2\r"
 SENT_O_MINUS_1 = b"O-1\r"
 
+REPLY_BANNER = b" GROUP 3 DTMS  7.10\r"
+REPLY_BANNER_TRUNCATED = b" -0 GROUP 3 DTMS  7.10\r"
+
 
 # --------------------------------------------------------------------------- #
 # Field / peak reading
@@ -85,6 +89,32 @@ class TestReadings:
         r = dtm.read_field()
         assert r.value == pytest.approx(-0.005)
         assert r.unit is Unit.UNKNOWN
+
+    def test_read_field_banner_raises_restarted(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.scripted([(SENT_F, REPLY_BANNER)])
+        with pytest.raises(DeviceRestartedError) as excinfo:
+            dtm.read_field()
+        assert fake.sent == [SENT_F]
+        assert excinfo.value.raw == REPLY_BANNER
+
+    def test_read_field_truncated_banner_raises_restarted(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.scripted([(SENT_F, REPLY_BANNER_TRUNCATED)])
+        with pytest.raises(DeviceRestartedError):
+            dtm.read_field()
+        assert fake.sent == [SENT_F]
+
+    def test_read_field_junk_is_plain_protocol_error(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.scripted([(SENT_F, b" 1.2#4T\r")])
+        with pytest.raises(ProtocolError) as excinfo:
+            dtm.read_field()
+        assert fake.sent == [SENT_F]
+        assert not isinstance(excinfo.value, DeviceRestartedError)
 
     def test_read_peak_sends_P(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
         fake.queue_reply(b" 2.9999T\r")
@@ -125,6 +155,14 @@ class TestRange:
     def test_get_range_parses_IR_reply(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
         fake.queue_reply(b" 2\r")
         assert dtm.get_range() == 2
+        assert fake.sent == [SENT_IR]
+
+    def test_get_range_banner_raises_restarted(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.scripted([(SENT_IR, REPLY_BANNER)])
+        with pytest.raises(DeviceRestartedError):
+            dtm.get_range()
         assert fake.sent == [SENT_IR]
 
     def test_set_range_sends_Rn(self, dtm: DTM151Serial, fake: FakeTransport) -> None:
@@ -1178,6 +1216,23 @@ class TestRestartAndReset:
         banner = dtm.restart()
         assert banner == " GROUP3 DTMS 7.10"
 
+    def test_restart_returns_spaced_banner(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.scripted([(SENT_CTRL_U, REPLY_BANNER)])
+        banner = dtm.restart()
+        assert fake.sent == [SENT_CTRL_U]
+        assert banner == " GROUP 3 DTMS  7.10"
+
+    def test_restart_returns_spaced_banner_with_echo_on(
+        self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        protocol.expect_command_returned = True
+        fake.scripted([(SENT_CTRL_U, SENT_CTRL_U + REPLY_BANNER)])
+        banner = dtm.restart()
+        assert fake.sent == [SENT_CTRL_U]
+        assert banner == " GROUP 3 DTMS  7.10"
+
     def test_restart_with_echo_on(
         self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
     ) -> None:
@@ -1202,3 +1257,124 @@ class TestRestartAndReset:
         fake.scripted([(SENT_CTRL_X, b" OVERFLOW\r")])
         with pytest.raises(Exception, match="OVERFLOW"):
             dtm.reset_to_defaults()
+
+
+class TestRestartBannerOnEveryPath:
+    """A boot banner on any path that expected another reply means a restart."""
+
+    def test_silent_setter_banner_raises_restarted(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.queue_reply(REPLY_BANNER)
+        with pytest.raises(DeviceRestartedError) as excinfo:
+            dtm.zero()
+        assert fake.sent == [SENT_Z]
+        assert excinfo.value.raw is not None
+        assert b"GROUP 3 DTMS" in excinfo.value.raw
+
+    def test_missing_echo_banner_raises_restarted(
+        self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        # A restart puts echo back to its S2-4 default, so the banner arrives
+        # without the returned command ahead of it.
+        protocol.expect_command_returned = True
+        fake.scripted([(SENT_F, REPLY_BANNER)])
+        with pytest.raises(DeviceRestartedError) as excinfo:
+            dtm.read_field()
+        assert fake.sent == [SENT_F]
+        assert excinfo.value.raw == REPLY_BANNER
+
+    def test_setter_missing_echo_banner_raises_restarted(
+        self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        protocol.expect_command_returned = True
+        fake.queue_reply(REPLY_BANNER)
+        with pytest.raises(DeviceRestartedError):
+            dtm.zero()
+        assert fake.sent == [SENT_Z]
+
+    def test_status_banner_raises_restarted(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.scripted([(SENT_IG, REPLY_BANNER)])
+        with pytest.raises(DeviceRestartedError):
+            dtm.get_status()
+        assert fake.sent == [SENT_IG]
+
+    def test_bool_flag_banner_raises_restarted(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.scripted([(SENT_ID, REPLY_BANNER)])
+        with pytest.raises(DeviceRestartedError):
+            dtm.get_filter_enabled()
+        assert fake.sent == [SENT_ID]
+
+    def test_dip_switch_banner_raises_restarted(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.scripted([(SENT_CTRL_D, REPLY_BANNER)])
+        with pytest.raises(DeviceRestartedError):
+            dtm.identify()
+        assert fake.sent == [SENT_CTRL_D]
+
+    def test_baud_code_banner_raises_restarted(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.scripted([(SENT_CTRL_D, DIP_REPLY_FACTORY), (SENT_CTRL_B, REPLY_BANNER)])
+        with pytest.raises(DeviceRestartedError):
+            dtm.identify()
+        assert fake.sent == [SENT_CTRL_D, SENT_CTRL_B]
+
+    def test_script_request_banner_raises_restarted(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        fake.scripted([(SENT_IR, REPLY_BANNER)])
+        with pytest.raises(DeviceRestartedError):
+            dtm.run_script("IR")
+        assert fake.sent == [SENT_IR]
+
+    def test_stream_start_ack_drain_banner_raises_restarted(
+        self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        protocol.expect_command_returned = True
+        fake.queue_reply(REPLY_BANNER)
+        with pytest.raises(DeviceRestartedError), dtm.stream_field():
+            pass
+        assert fake.sent == [b"SM1\r"]
+
+    def test_control_missing_echo_banner_raises_restarted(
+        self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        protocol.expect_command_returned = True
+        fake.scripted([(SENT_CTRL_X, REPLY_BANNER)])
+        with pytest.raises(DeviceRestartedError):
+            dtm.reset_to_defaults()
+        assert fake.sent == [SENT_CTRL_X]
+
+    def test_stream_read_after_restart_banner_raises_restarted(
+        self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        fake.scripted([(SENT_CTRL_U, REPLY_BANNER)])
+        dtm.restart()
+        fake.queue_reply(REPLY_BANNER)
+        with pytest.raises(DeviceRestartedError):
+            protocol.read_next(1.0)
+
+    def test_ack_drain_after_restart_banner_raises_restarted(
+        self, dtm: DTM151Serial, fake: FakeTransport, protocol: Group3Protocol
+    ) -> None:
+        fake.scripted([(SENT_CTRL_U, REPLY_BANNER)])
+        dtm.restart()
+        fake.queue_reply(REPLY_BANNER)
+        with pytest.raises(DeviceRestartedError):
+            protocol.drain_setter_ack()
+
+    def test_stream_cleanup_keeps_restart_error(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        # After the restart the device echoes again, so the cleanup SM0 comes back.
+        fake.queue_reply(REPLY_BANNER)
+        fake.queue_reply(b"SM0\r")
+        with pytest.raises(DeviceRestartedError), dtm.stream_field() as stream:
+            next(iter(stream))
+        assert fake.sent == [b"SM1\r", b"SM0\r"]

@@ -26,6 +26,7 @@ from group3.exceptions import (
     DataCarrierError,
     DeviceError,
     DeviceOverflowError,
+    DeviceRestartedError,
     DivideByZeroError,
     FixedRangeProbeError,
     FramingError,
@@ -84,6 +85,10 @@ _NUMBER_RE: Final = re.compile(
     re.VERBOSE,
 )
 
+# Searched, not anchored: a restart mid-reply leaves the truncated reply ahead of
+# the banner (bench-observed ``' -0 GROUP 3 DTMS  7.10'``).
+_BANNER_RE: Final = re.compile(r"GROUP\s*3\s*DTMS", re.IGNORECASE)
+
 
 def check_error(reply: str) -> None:
     """Raise the appropriate :class:`DeviceError` subclass if ``reply`` is an error string.
@@ -101,6 +106,25 @@ def check_error(reply: str) -> None:
     for needle, exc_class in _ERROR_TABLE:
         if needle in upper:
             raise exc_class(needle, raw=reply)
+
+
+def check_restarted(reply: str, raw: bytes | None = None) -> None:
+    """Raise :class:`DeviceRestartedError` if ``reply`` carries the boot banner.
+
+    Call only where the banner is not the expected answer — not on ``Ctrl-U``.
+
+    Args:
+        reply: The reply string; it need not be terminator-stripped.
+        raw: The bytes to attach to the exception. Defaults to ``reply``.
+
+    Raises:
+        DeviceRestartedError: ``reply`` carries the boot banner.
+    """
+    if _BANNER_RE.search(reply):
+        raise DeviceRestartedError(
+            f"Device restarted: boot banner in place of the expected reply, got {reply!r}",
+            raw=raw if raw is not None else reply.encode("ascii", errors="replace"),
+        )
 
 
 def parse_float(reply: str) -> float:

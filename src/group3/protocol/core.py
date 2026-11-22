@@ -21,8 +21,8 @@ from dataclasses import dataclass
 
 from group3.exceptions import ProtocolError
 from group3.exceptions import TimeoutError as Group3TimeoutError
-from group3.protocol import codec
-from group3.protocol.parser import check_error
+from group3.protocol import codec, commands
+from group3.protocol.parser import check_error, check_restarted
 from group3.transport.base import Transport
 
 
@@ -208,6 +208,7 @@ class Group3Protocol:
             CommandError: ``command`` contains non-ASCII characters.
             TransportError: Underlying I/O failed.
             TimeoutError: No reply within the timeout.
+            DeviceRestartedError: The boot banner arrived.
             ProtocolError: Reply was not valid ASCII.
             DeviceError: The device reported a named error.
         """
@@ -244,7 +245,7 @@ class Group3Protocol:
             raise
         self._pending_tx.clear()
         accumulated_rx = bytearray(raw)
-        self._last = _LastExchange(tx=full_tx, rx=raw)
+        self._received(full_tx, raw)
 
         def _drain_residue(current: bytes) -> bytes:
             """Discard terminator-only frames until real data arrives.
@@ -269,7 +270,7 @@ class Group3Protocol:
                     remaining if remaining is not None else 1.0
                 )
                 accumulated_rx.extend(next_frame)
-                self._last = _LastExchange(tx=full_tx, rx=bytes(accumulated_rx))
+                self._received(full_tx, bytes(accumulated_rx))
                 current = next_frame
             return current
 
@@ -298,7 +299,7 @@ class Group3Protocol:
                     remaining if remaining is not None else 1.0
                 )
                 accumulated_rx.extend(raw)
-                self._last = _LastExchange(tx=full_tx, rx=bytes(accumulated_rx))
+                self._received(full_tx, bytes(accumulated_rx))
                 raw = _strip_returned_commands(raw, echo_prefix, self.terminator)
 
         reply = codec.strip_terminators(codec.decode(raw))
@@ -345,8 +346,9 @@ class Group3Protocol:
 
         If the drained reply is a §4.5.3 error string the corresponding
         :class:`DeviceError` is raised — the addressed device rejected the
-        prefix command. A non-empty, non-error reply raises
-        :class:`ProtocolError` because the wire is now out of sync.
+        prefix command. The boot banner raises :class:`DeviceRestartedError`.
+        Any other non-empty, non-error reply raises :class:`ProtocolError`
+        because the wire is now out of sync.
         """
         if window <= 0:
             return
@@ -356,7 +358,7 @@ class Group3Protocol:
         accumulated = bytearray(raw)
         # Update only the rx side; preserve _last.tx and _pending_tx so the
         # audit trail of the surrounding exchange (e.g. ``An\rF\r``) is intact.
-        self._last = _LastExchange(tx=self._last.tx, rx=bytes(accumulated))
+        self._received(self._last.tx, bytes(accumulated))
 
         # Strip leading terminator residue from a prior exchange before
         # further validation. A stale CR/LF here would otherwise be misread
@@ -389,7 +391,7 @@ class Group3Protocol:
                 if not tail:
                     break
                 accumulated.extend(tail)
-                self._last = _LastExchange(tx=self._last.tx, rx=bytes(accumulated))
+                self._received(self._last.tx, bytes(accumulated))
                 raw = _strip_returned_commands(tail, echo_prefix, self.terminator)
 
         reply = codec.strip_terminators(codec.decode(raw))
@@ -490,6 +492,7 @@ class Group3Protocol:
         Raises:
             TransportError: Underlying I/O failed.
             TimeoutError: No reply within ``timeout``.
+            DeviceRestartedError: The boot banner arrived.
             ProtocolError: Reply was not valid ASCII.
             DeviceError: The device sent a named error string.
         """
@@ -505,7 +508,7 @@ class Group3Protocol:
             # Streaming reads don't carry a "request" payload — _pending_tx
             # and _last.tx are preserved as-is so the last paired TX still
             # reflects the most recent command the caller issued.
-            self._last = _LastExchange(tx=self._last.tx, rx=raw)
+            self._received(self._last.tx, raw)
             reply = codec.strip_terminators(codec.decode(raw))
             if reply == "":
                 # Terminator-only residue (e.g. stale setter ack). Skip and
@@ -565,6 +568,7 @@ class Group3Protocol:
             CommandError: ``command`` is not ASCII.
             TransportError: Underlying I/O failed.
             DeviceError: A deferred error string arrived from the device.
+            DeviceRestartedError: The boot banner arrived.
             ProtocolError: A non-empty, non-error reply arrived.
         """
         payload = codec.encode(command, self.terminator)
@@ -601,7 +605,7 @@ class Group3Protocol:
             echo_prefix = _echo_prefix(payload, self.terminator)
             if not raw.startswith(echo_prefix):
                 self._pending_tx.clear()
-                self._last = _LastExchange(tx=full_tx, rx=bytes(accumulated_rx))
+                self._received(full_tx, bytes(accumulated_rx))
                 raise ProtocolError(
                     f"command echo expected for setter {command!r} but reply "
                     f"does not start with the echoed payload",
@@ -622,7 +626,7 @@ class Group3Protocol:
             # transmission for this setter is complete; clear pending_tx
             # and record it.
             self._pending_tx.clear()
-            self._last = _LastExchange(tx=full_tx, rx=bytes(accumulated_rx))
+            self._received(full_tx, bytes(accumulated_rx))
             reply = codec.strip_terminators(codec.decode(raw))
             if reply == "":
                 # Terminator-only frame carries no payload — manual §4.5.2
@@ -641,7 +645,7 @@ class Group3Protocol:
         # Silent success. Leave pending_tx populated so a subsequent send()
         # can include this setter's bytes in last_raw_tx, matching the debug
         # semantics of other write-only operations.
-        self._last = _LastExchange(tx=full_tx, rx=bytes(accumulated_rx))
+        self._received(full_tx, bytes(accumulated_rx))
 
     def send_control(
         self,
@@ -671,6 +675,8 @@ class Group3Protocol:
             The reply string, terminator stripped, echo prefix stripped if present.
 
         Raises:
+            DeviceRestartedError: The boot banner arrived in reply to any
+                payload but ``Ctrl-U``.
             ProtocolError: ``expect_echo=True`` but the reply does not start with
                 ``payload``; or the reply is not valid ASCII.
             DeviceError: The device returned a §4.5.3 named-error string.
@@ -693,7 +699,9 @@ class Group3Protocol:
             self._last = _LastExchange(tx=payload, rx=b"")
             raise
         accumulated_rx = bytearray(raw)
-        self._last = _LastExchange(tx=payload, rx=raw)
+        # Ctrl-U restarts the instrument, so the banner is its answer.
+        allow_banner = payload == commands.CTRL_U
+        self._received(payload, raw, allow_banner=allow_banner)
 
         # Detect or enforce echoed prefix. Control-byte commands have no
         # terminator, so the echo prefix is the full payload.
@@ -725,12 +733,23 @@ class Group3Protocol:
                     remaining if remaining is not None else 1.0
                 )
                 accumulated_rx.extend(next_raw)
-                self._last = _LastExchange(tx=payload, rx=bytes(accumulated_rx))
+                self._received(payload, bytes(accumulated_rx), allow_banner=allow_banner)
                 raw = _strip_returned_commands(next_raw, echo_prefix, self.terminator)
 
         reply = codec.strip_terminators(codec.decode(raw))
         check_error(reply)
         return reply
+
+    def _received(self, tx: bytes, rx: bytes, *, allow_banner: bool = False) -> None:
+        """Record an exchange for the debug accessors, then refuse a boot banner.
+
+        Every validated receive passes through here, so a restart is reported
+        however the reply was going to be used. ``allow_banner`` is for the one
+        exchange whose answer is the banner: ``Ctrl-U``.
+        """
+        self._last = _LastExchange(tx=tx, rx=rx)
+        if not allow_banner:
+            check_restarted(rx.decode("ascii", errors="replace"), raw=rx)
 
     # ------------------------------------------------------------------
     # debug accessors

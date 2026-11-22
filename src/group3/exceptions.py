@@ -54,6 +54,16 @@ class ProtocolError(Group3Error):
         return base
 
 
+class DeviceRestartedError(ProtocolError):
+    """The instrument's boot banner arrived where a numeric reply was expected.
+
+    The instrument restarted, so every switch-selectable setting, including the
+    unit (``UFc``) and unit symbol (``SUn``), is back at its DIP-switch default
+    (DTM-151-S Manual v7.1, page 4-9). Set the instrument up again before
+    trusting further readings.
+    """
+
+
 class CommandError(Group3Error):
     """A local caller passed an invalid argument to a command builder or setter."""
 
