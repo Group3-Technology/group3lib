@@ -407,7 +407,7 @@ def u_set_display_units(unit: str) -> str:
     display and reply unit suffix. The vendor command reference writes
     the syntax as ``Ufc`` — the ``f`` is a *literal* letter, not a
     placeholder, and ``c`` is the configurable character (``G`` or ``T``).
-    Bench-verified on FT572EW5 on 2026-05-09: ``UT``/``UG`` are rejected
+    Bench-verified on 2026-05-09: ``UT``/``UG`` are rejected
     with ``INVALID COMMAND ENTRY``; the device is case-insensitive on the
     full command (``UFG``/``UFT``/``Ufg``/``Uft`` all work). This builder
     emits the documented form ``UFG``/``UFT``.

@@ -26,6 +26,7 @@ from group3.exceptions import (
     DataCarrierError,
     DeviceError,
     DeviceOverflowError,
+    DeviceRestartedError,
     DivideByZeroError,
     FixedRangeProbeError,
     FramingError,
@@ -84,6 +85,10 @@ _NUMBER_RE: Final = re.compile(
     re.VERBOSE,
 )
 
+# Searched, not anchored: a restart mid-reply leaves the truncated reply ahead of
+# the banner (bench-observed ``' -0 GROUP 3 DTMS  7.10'``).
+_BANNER_RE: Final = re.compile(r"GROUP\s*3\s*DTMS", re.IGNORECASE)
+
 
 def check_error(reply: str) -> None:
     """Raise the appropriate :class:`DeviceError` subclass if ``reply`` is an error string.
@@ -101,6 +106,25 @@ def check_error(reply: str) -> None:
     for needle, exc_class in _ERROR_TABLE:
         if needle in upper:
             raise exc_class(needle, raw=reply)
+
+
+def check_restarted(reply: str, raw: bytes | None = None) -> None:
+    """Raise :class:`DeviceRestartedError` if ``reply`` carries the boot banner.
+
+    Call only where the banner is not the expected answer — not on ``Ctrl-U``.
+
+    Args:
+        reply: The reply string; it need not be terminator-stripped.
+        raw: The bytes to attach to the exception. Defaults to ``reply``.
+
+    Raises:
+        DeviceRestartedError: ``reply`` carries the boot banner.
+    """
+    if _BANNER_RE.search(reply):
+        raise DeviceRestartedError(
+            f"Device restarted: boot banner in place of the expected reply, got {reply!r}",
+            raw=raw if raw is not None else reply.encode("ascii", errors="replace"),
+        )
 
 
 def parse_float(reply: str) -> float:
@@ -236,7 +260,7 @@ def parse_dip_switches(reply: str) -> DipSwitches:
     space (manual section 4.5.2); this parser tolerates an optional leading
     space and requires exactly 16 ``0``/``1`` characters.
 
-    Verified against bench unit FT572EW5 on 2026-05-09:
+    Verified against a bench unit on 2026-05-09:
     the firmware formats the reply as ``" 0101 0110 0000 0000 \\n\\r"`` —
     four space-separated 4-bit nibbles plus a trailing space — so this
     parser strips **all** whitespace, not just leading/trailing. Bit

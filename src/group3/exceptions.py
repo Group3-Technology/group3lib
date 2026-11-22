@@ -54,6 +54,26 @@ class ProtocolError(Group3Error):
         return base
 
 
+class DeviceRestartedError(ProtocolError):
+    """The instrument's boot banner arrived in place of the expected reply.
+
+    The instrument restarted as if freshly powered up, so every
+    switch-selectable setting, including the unit (``UFG``/``UFT``), the unit
+    symbol (``SUn``) and echo (S2-4), is back at its DIP-switch default
+    (DTM-151-S Manual v7.1, page 4-9, and Table 9, ``Ctrl-U``, page 4-11). On a direct
+    :class:`~group3.Group3Protocol`, call :meth:`~group3.DTM151Serial.identify`
+    first, then re-apply your settings; on a G3CL
+    :class:`~group3.AddressedProtocol`, where ``identify`` is not supported,
+    re-apply them without it. On a G3CL loop the banner may come from any
+    instrument on the loop, not only the addressed one.
+
+    Raised only when the banner arrives in a reply: pending input is discarded
+    before each request, so a restart while the link is idle goes unreported.
+    Where results depend on settings, also check the evidence in each reply,
+    such as the unit symbol.
+    """
+
+
 class CommandError(Group3Error):
     """A local caller passed an invalid argument to a command builder or setter."""
 

@@ -108,6 +108,42 @@ and required on anything that returns commands — a fiber-optic/G3CL link, or a
 device with DIP S2-4 echo ON. Make it your first call and neither case can
 surprise you.
 
+### Detecting a restart
+
+If the instrument restarts during an exchange — a power blip, or a `Ctrl-U`
+from another host — its boot banner arrives in place of the reply, and the SDK
+raises `DeviceRestartedError`. The instrument restarts as if freshly powered
+up, so every switch-selectable setting, including the unit (`UFG`/`UFT`), the
+unit symbol (`SUn`) and echo (S2-4), is then back at its DIP-switch default
+(manual v7.1, page 4-9, and Table 9, `Ctrl-U`, page 4-11). On a direct `Group3Protocol`,
+call `identify()` first, so the protocol matches the echo state again, then
+re-apply your settings:
+
+```python
+from group3 import DeviceRestartedError
+
+try:
+    reading = dtm.read_field()
+except DeviceRestartedError:
+    dtm.identify()
+    configure(dtm)              # your own setup: unit, range, filter, …
+    reading = dtm.read_field()
+```
+
+On a G3CL multi-drop session (`AddressedProtocol`), `identify()` raises
+`NotImplementedError`; re-apply your settings without it. On a G3CL loop the
+banner may come from any instrument on the loop, not only the addressed one.
+
+`DeviceRestartedError` subclasses `ProtocolError`, so existing
+`except ProtocolError` handlers still catch it. It covers readings from
+`stream_field()` too.
+
+The error is raised only when the banner arrives in a reply. Pending input is
+discarded before each request, so a restart while the link is idle between
+requests goes unreported. If your results depend on the instrument's settings,
+also check the evidence in each reply — for example that `reading.unit` is the
+unit you set.
+
 ### Fiber-optic (FTR) and echo-enabled links
 
 On a fiber-optic link the host sits on a Group3 Communication Loop, and the loop

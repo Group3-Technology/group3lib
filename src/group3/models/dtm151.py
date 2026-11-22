@@ -449,16 +449,18 @@ class DTM151Serial:
     def restart(self) -> str:
         """Restart the DTM via the ``Ctrl-U`` (``\\x15``) control byte.
 
-        Re-runs the firmware boot sequence and returns the banner string
-        (e.g. ``"GROUP3 DTMS 7.10"``). Numerical user settings are NOT
-        cleared unless DIP S2-8 is ON. Echo state is the device's runtime
-        state from before — the protocol's
+        Re-runs the firmware boot sequence, as if freshly powered up, and
+        returns the banner string (e.g. ``" GROUP 3 DTMS  7.10"``). Numerical
+        user settings are NOT cleared unless DIP S2-8 is ON. Every
+        switch-selectable setting, echo included, returns to its DIP-switch
+        default (DTM-151-S Manual v7.1, page 4-9, and Table 9, ``Ctrl-U``,
+        page 4-11), so call :meth:`identify` afterwards; the protocol's
         :attr:`~group3.protocol.core.Group3Protocol.expect_command_returned` is not
-        modified.
+        modified here.
 
         Returns:
-            The boot banner string, with leading space and terminator
-            stripped.
+            The boot banner string, terminator stripped and leading space
+            kept.
 
         Raises:
             NotImplementedError: ``self._protocol`` is not a

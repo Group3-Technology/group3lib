@@ -6,6 +6,7 @@ import pytest
 
 from group3.exceptions import (
     DeviceOverflowError,
+    DeviceRestartedError,
     FixedRangeProbeError,
     InvalidCommandError,
     NoProbeError,
@@ -15,6 +16,7 @@ from group3.exceptions import (
 )
 from group3.protocol.parser import (
     check_error,
+    check_restarted,
     parse_baud_code,
     parse_bool_flag,
     parse_dip_switches,
@@ -125,6 +127,42 @@ class TestParseReading:
             parse_reading(" garbage")
 
 
+class TestRestartBanner:
+    """The boot banner anywhere in a reply means the instrument restarted."""
+
+    def test_banner_raises_restarted(self) -> None:
+        with pytest.raises(DeviceRestartedError) as excinfo:
+            check_restarted(" GROUP 3 DTMS  7.10")
+        assert excinfo.value.raw == b" GROUP 3 DTMS  7.10"
+
+    def test_truncated_reply_ahead_of_banner_raises_restarted(self) -> None:
+        with pytest.raises(DeviceRestartedError):
+            check_restarted(" -0 GROUP 3 DTMS  7.10")
+
+    def test_banner_without_space_or_uppercase_raises_restarted(self) -> None:
+        with pytest.raises(DeviceRestartedError):
+            check_restarted(" Group3 DTMS 7.10")
+
+    def test_banner_without_any_space_raises_restarted(self) -> None:
+        with pytest.raises(DeviceRestartedError):
+            check_restarted(" GROUP3DTMS 7.11")
+
+    def test_attaches_given_raw(self) -> None:
+        with pytest.raises(DeviceRestartedError) as excinfo:
+            check_restarted(" GROUP 3 DTMS  7.10", raw=b" GROUP 3 DTMS  7.10\r")
+        assert excinfo.value.raw == b" GROUP 3 DTMS  7.10\r"
+
+    def test_restarted_is_a_protocol_error(self) -> None:
+        assert issubclass(DeviceRestartedError, ProtocolError)
+
+    def test_junk_is_not_restarted(self) -> None:
+        check_restarted(" garbage")  # must not raise
+        check_restarted(" DTMS")  # must not raise
+
+    def test_reading_is_not_restarted(self) -> None:
+        check_restarted(" 1.2345T")  # must not raise
+
+
 class TestParseStatus:
     def test_dc_continuous(self) -> None:
         s = parse_status(" DC")
@@ -206,7 +244,7 @@ class TestParseDipSwitches:
         assert dip.units_gauss is False
 
     def test_bench_unit_reply_format_with_nibble_spaces(self) -> None:
-        # Verbatim reply from FT572EW5 on 2026-05-09: four space-separated
+        # Verbatim reply from a bench unit on 2026-05-09: four space-separated
         # 4-bit nibbles. Cross-checked bits: S2-2 (CR), S2-3 (double term),
         # S2-5 (gauss), S2-7 (filter ON) — all ON; everything else OFF.
         dip = parse_dip_switches(" 0101 0110 0000 0000 ")
