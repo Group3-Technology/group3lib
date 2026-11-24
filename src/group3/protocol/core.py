@@ -77,6 +77,21 @@ def _strip_returned_commands(raw: bytes, echo_prefix: bytes, terminator: bytes) 
     return raw
 
 
+def _newest_reply(frames: list[bytes], echo_prefix: bytes) -> bytes:
+    """Return the latest command's reply from the frames read after a timeout.
+
+    The device answers in order, so the newest reply is the latest command's.
+    Where the command comes back on the wire, it leads its reply, so the
+    reply runs from the last returned copy on; a genuine reply starts with
+    a space (manual §4.5.2) and so never looks like a returned copy.
+    """
+    copies = [i for i, frame in enumerate(frames) if frame.startswith(echo_prefix)]
+    if echo_prefix and copies:
+        return b"".join(frames[copies[-1]:])
+    replies = [frame for frame in frames if frame.strip(codec.CR + codec.LF)]
+    return replies[-1] if replies else frames[-1]
+
+
 def _command_returned_error(command: str, raw: bytes) -> ProtocolError:
     """Build the diagnostic raised when a reply is just the command, returned.
 
@@ -216,7 +231,8 @@ class Group3Protocol:
         Raises:
             CommandError: ``command`` contains non-ASCII characters.
             TransportError: Underlying I/O failed.
-            TimeoutError: No reply within the timeout.
+            TimeoutError: No reply within the timeout. The next request
+                then waits at least 0.2 s longer, to pass over a late reply.
             DeviceRestartedError: The boot banner arrived.
             ProtocolError: Reply was not valid ASCII.
             DeviceError: The device reported a named error.
@@ -226,7 +242,8 @@ class Group3Protocol:
         # Single deadline shared by the initial request() and any residue-
         # draining read_reply() calls below, so a caller asking for
         # send(timeout=1.0) sees roughly 1 s of total wall-clock cost — not
-        # 2 s when residue happens to be queued.
+        # 2 s when residue happens to be queued. The first request after a
+        # timeout reads on past it for a late reply (see _request).
         deadline = (
             time.monotonic() + effective_timeout
             if effective_timeout is not None
@@ -243,7 +260,7 @@ class Group3Protocol:
         # reply parses as an error.
         full_tx = bytes(self._pending_tx) + payload
         try:
-            raw = self._request(payload, full_tx, _remaining())
+            raw, received = self._request(payload, _remaining())
         except BaseException:
             # Record the attempted TX so callers inspecting last_raw_tx after
             # catching the exception can see exactly what went on the wire.
@@ -253,8 +270,8 @@ class Group3Protocol:
             self._pending_tx.clear()
             raise
         self._pending_tx.clear()
-        accumulated_rx = bytearray(raw)
-        self._received(full_tx, raw)
+        accumulated_rx = bytearray(received)
+        self._received(full_tx, received)
 
         def _drain_residue(current: bytes) -> bytes:
             """Discard terminator-only frames until real data arrives.
@@ -705,12 +722,12 @@ class Group3Protocol:
         # Ctrl-U restarts the instrument, so the banner is its answer.
         allow_banner = payload == commands.CTRL_U
         try:
-            raw = self._request(payload, payload, _remaining(), allow_banner=allow_banner)
+            raw, received = self._request(payload, _remaining())
         except BaseException:
             self._last = _LastExchange(tx=payload, rx=b"")
             raise
-        accumulated_rx = bytearray(raw)
-        self._received(payload, raw, allow_banner=allow_banner)
+        accumulated_rx = bytearray(received)
+        self._received(payload, received, allow_banner=allow_banner)
 
         # Detect or enforce echoed prefix. Control-byte commands have no
         # terminator, so the echo prefix is the full payload.
@@ -749,20 +766,13 @@ class Group3Protocol:
         check_error(reply)
         return reply
 
-    def _request(
-        self,
-        payload: bytes,
-        tx: bytes,
-        timeout: float | None,
-        *,
-        allow_banner: bool = False,
-    ) -> bytes:
-        """Write ``payload`` and return its reply frame.
+    def _request(self, payload: bytes, timeout: float | None) -> tuple[bytes, bytes]:
+        """Write ``payload`` and return its reply frame and every byte read.
 
         After a request has timed out, its reply can arrive in the next
-        request's window. The device answers in order, so read on until the
-        link is quiet and keep the newest reply; each one passed over still
-        goes through :meth:`_received`, so a late banner is reported.
+        request's window. The device answers in order, so read on while
+        frames keep coming and keep the newest reply. The caller checks
+        every byte read, so a passed-over banner is still reported.
         """
         try:
             raw = self.transport.request(payload, timeout=timeout)
@@ -770,17 +780,15 @@ class Group3Protocol:
             self._reply_may_be_late = True
             raise
         if not self._reply_may_be_late:
-            return raw
+            return raw, raw
         self._reply_may_be_late = False
+        frames = [raw]
         for _ in range(_LATE_REPLY_MAX_FRAMES):
             frame = self.transport.read_optional(_LATE_REPLY_WINDOW_S)
             if not frame:
                 break
-            if codec.strip_terminators(codec.decode(frame)) == "":
-                continue
-            self._received(tx, raw, allow_banner=allow_banner)
-            raw = frame
-        return raw
+            frames.append(frame)
+        return _newest_reply(frames, _echo_prefix(payload, self.terminator)), b"".join(frames)
 
     def _received(self, tx: bytes, rx: bytes, *, allow_banner: bool = False) -> None:
         """Record an exchange for the debug accessors, then refuse a boot banner.
