@@ -157,6 +157,14 @@ class TestRange:
         assert dtm.get_range() == 2
         assert fake.sent == [SENT_IR]
 
+    def test_get_range_out_of_range_reply_is_a_protocol_error(
+        self, dtm: DTM151Serial, fake: FakeTransport
+    ) -> None:
+        # A misaligned reply (here a temperature) is a bad reply, not a bad argument.
+        fake.queue_reply(b" 20.00\r")
+        with pytest.raises(ProtocolError, match="out-of-range index 20"):
+            dtm.get_range()
+
     def test_get_range_banner_raises_restarted(
         self, dtm: DTM151Serial, fake: FakeTransport
     ) -> None:

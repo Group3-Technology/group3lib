@@ -22,6 +22,7 @@ from group3.exceptions import (
     BadTemperatureReadingError,
     CommandError,
     NoTemperatureProbeError,
+    ProtocolError,
     ResetError,
 )
 from group3.protocol import commands
@@ -518,7 +519,7 @@ class DTM151Serial:
         reply = self._protocol.send(commands.IR)
         value = parse_int(reply)
         if not 0 <= value <= 3:
-            raise CommandError(f"device reported out-of-range index {value} for IR")
+            raise ProtocolError(f"device reported out-of-range index {value} for IR")
         return value
 
     def set_range(self, index: int) -> None:
