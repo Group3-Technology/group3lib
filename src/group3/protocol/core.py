@@ -233,7 +233,7 @@ class Group3Protocol:
         Raises:
             CommandError: ``command`` contains non-ASCII characters.
             TransportError: Underlying I/O failed.
-            TimeoutError: No reply within the timeout. The next request
+            TimeoutError: No reply within the timeout. The next query
                 then waits at least 0.2 s longer, to pass over a late reply.
             DeviceRestartedError: The boot banner arrived.
             ProtocolError: Reply was not valid ASCII.
@@ -712,6 +712,8 @@ class Group3Protocol:
             ProtocolError: ``expect_echo=True`` but the reply does not start with
                 ``payload``; or the reply is not valid ASCII.
             DeviceError: The device returned a §4.5.3 named-error string.
+            TimeoutError: No reply within the timeout. The next query then
+                waits at least 0.2 s longer, to pass over a late reply.
         """
         with self._late_reply_on_timeout():
             return self._send_control(payload, expect_echo=expect_echo, timeout=timeout)

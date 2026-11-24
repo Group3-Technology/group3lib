@@ -148,26 +148,32 @@ unit you set.
 
 A request can time out while its reply is still on the way — a restarting
 instrument has answered 1.33 s after a 1.0 s timeout. That reply then arrives
-in the next request's window. So the first query after a timeout — `send()`
-or `send_control()`, whichever part of it timed out — reads on while frames
-keep coming (each wait 0.2 s, at most ten frames) and returns the newest reply:
-the device answers in order, so the newest is the latest command's. Where
-commands come back on the wire, the reply runs from the last returned copy of
-the command. `last_raw_rx` holds every frame read, and a boot banner among them
-raises `DeviceRestartedError`.
+in the next request's window. So on a point-to-point link the first query after
+a timeout — `send()` or `send_control()`, whichever part of it timed out —
+reads on while frames keep coming (each wait 0.2 s, at most ten frames) and
+returns the newest reply: the device answers in order, so the newest is the
+latest command's. Where commands come back on the wire, the reply runs from the
+last returned copy of the command. `last_raw_rx` holds every frame read, and a
+boot banner among them raises `DeviceRestartedError`.
 
 This holds while the latest command's reply follows the late one within
 0.2 s. If it comes later, or never (the instrument may drop a command while it
-boots), that first query can return the earlier command's reply; where
-commands come back on the wire, that shows as a `ProtocolError` instead. Check
-the evidence in each reply where it matters — the unit symbol of a reading,
-the `C` of a temperature; `get_range()` raises `ProtocolError` for an index
-outside 0–3.
+boots), that first query can return the earlier command's reply. Check the
+evidence in each reply where it matters — the unit symbol of a reading, the `C`
+of a temperature; `get_range()` raises `ProtocolError` for an index outside
+0–3.
 
 Setters do not read on. A late reply that arrives in a setter's ack window is
-read as its ack, so the setter raises — `ProtocolError` for a reading, the
-matching `DeviceError` for an error string, `DeviceRestartedError` for the
-banner. One that arrives later is discarded before the next write.
+read as its ack, so the setter raises: `DeviceRestartedError` for the banner,
+otherwise `ProtocolError`, or on a plain link the matching `DeviceError` for an
+error string. A late reply that arrives after that window is passed over by the
+next query.
+
+On a G3CL multi-drop session (`AddressedProtocol`) the address command's ack is
+read before the query, so a late reading there raises `ProtocolError` (an
+error string, its `DeviceError`); the addressed query after it reads on as
+above. A stream (`read_next`) does not
+read on after a timeout; leaving the stream discards pending input.
 
 The first query after a timeout takes at least 0.2 s longer, up to about 2 s
 while frames keep coming.
