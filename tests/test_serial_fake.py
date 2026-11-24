@@ -273,6 +273,18 @@ class TestLateReplyAfterTimeout:
             p.send("F")
         assert p.send("F") == " 1.90"
 
+    def test_an_echo_link_keeps_the_echo_and_its_reply(self) -> None:
+        """With S2-4 echo the command comes back glued to its reply."""
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_error(TimeoutError("Timed out after 1.0s with no reply"))
+        fake.queue_reply(b" 1.86\r")
+        fake.queue_reply(b"F 1.90\r")
+        p = Group3Protocol(fake, expect_command_returned=True)
+        with pytest.raises(TimeoutError):
+            p.send("F")
+        assert p.send("F") == " 1.90"
+
     def test_a_loop_link_without_a_late_reply(self) -> None:
         fake = FakeTransport()
         fake.open()
