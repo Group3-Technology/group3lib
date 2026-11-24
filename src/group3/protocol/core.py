@@ -15,8 +15,10 @@ tests and users can inspect them for debugging.
 
 from __future__ import annotations
 
+import contextlib
 import time
 import warnings
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 from group3.exceptions import ProtocolError
@@ -237,6 +239,10 @@ class Group3Protocol:
             ProtocolError: Reply was not valid ASCII.
             DeviceError: The device reported a named error.
         """
+        with self._late_reply_on_timeout():
+            return self._send(command, timeout)
+
+    def _send(self, command: str, timeout: float | None) -> str:
         payload = codec.encode(command, self.terminator)
         effective_timeout = timeout if timeout is not None else self.timeout
         # Single deadline shared by the initial request() and any residue-
@@ -707,6 +713,12 @@ class Group3Protocol:
                 ``payload``; or the reply is not valid ASCII.
             DeviceError: The device returned a §4.5.3 named-error string.
         """
+        with self._late_reply_on_timeout():
+            return self._send_control(payload, expect_echo=expect_echo, timeout=timeout)
+
+    def _send_control(
+        self, payload: bytes, *, expect_echo: bool | None, timeout: float | None
+    ) -> str:
         effective_timeout = timeout if timeout is not None else self.timeout
         deadline = (
             time.monotonic() + effective_timeout
@@ -766,6 +778,15 @@ class Group3Protocol:
         check_error(reply)
         return reply
 
+    @contextlib.contextmanager
+    def _late_reply_on_timeout(self) -> Iterator[None]:
+        """Remember a timeout after the write: the reply may still be on the way."""
+        try:
+            yield
+        except Group3TimeoutError:
+            self._reply_may_be_late = True
+            raise
+
     def _request(self, payload: bytes, timeout: float | None) -> tuple[bytes, bytes]:
         """Write ``payload`` and return its reply frame and every byte read.
 
@@ -774,11 +795,7 @@ class Group3Protocol:
         frames keep coming and keep the newest reply. The caller checks
         every byte read, so a passed-over banner is still reported.
         """
-        try:
-            raw = self.transport.request(payload, timeout=timeout)
-        except Group3TimeoutError:
-            self._reply_may_be_late = True
-            raise
+        raw = self.transport.request(payload, timeout=timeout)
         if not self._reply_may_be_late:
             return raw, raw
         self._reply_may_be_late = False
