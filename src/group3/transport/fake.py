@@ -15,6 +15,10 @@
    discards. The queue in (2) models what the device sends *next*; with no
    clock, the two cannot be told apart without saying which is which.
 
+After a queued timeout, ``Group3Protocol`` reads on for a late reply once its
+next request is answered, and that read takes queued replies too. Queue a reply
+only once the command it answers has been sent, or use :meth:`scripted`.
+
 All sent payloads are appended to :attr:`sent` (a public list) for inspection.
 """
 

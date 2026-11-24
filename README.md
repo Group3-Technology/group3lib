@@ -144,6 +144,26 @@ requests goes unreported. If your results depend on the instrument's settings,
 also check the evidence in each reply — for example that `reading.unit` is the
 unit you set.
 
+### Replies that arrive after a timeout
+
+A request can time out while its reply is still on the way — a restarting
+instrument has answered 1.33 s after a 1.0 s timeout. That reply then arrives
+in the next request's window. So the first request after a timeout reads on
+while frames keep coming (each wait 0.2 s, at most ten frames) and returns the
+newest reply: the device answers in order, so the newest is the latest
+command's. `last_raw_rx` holds every frame read, and a boot banner among them
+raises `DeviceRestartedError`.
+
+This holds while the latest command's reply follows the late one within
+0.2 s. If it comes later, or never (the instrument may drop a command while it
+boots), that first request can return the earlier command's reply. Check the
+evidence in each reply where it matters — the unit symbol of a reading, the
+`C` of a temperature; `get_range()` raises `ProtocolError` for an index
+outside 0–3.
+
+The first request after a timeout takes at least 0.2 s longer, up to about
+2 s while frames keep coming.
+
 ### Fiber-optic (FTR) and echo-enabled links
 
 On a fiber-optic link the host sits on a Group3 Communication Loop, and the loop
@@ -455,10 +475,7 @@ Other inherited assumptions worth confirming on your unit's DIP-switch settings
   cover any combination transparently.
 - **A restarting instrument can answer after the timeout.** After a `Ctrl-U`
   the first `F` was answered 1.33 s after it was sent, against a 1.0 s
-  timeout, with the retry's own reply about 30 ms behind it. After a timeout
-  the next request reads on until the link is quiet and returns the newest
-  reply — the device answers in order — so a late reply is never handed to a
-  later command. That first request after a timeout costs up to 0.2 s more.
+  timeout, and the retry's own reply followed about 30 ms behind it.
 
 ## Layer diagram
 
