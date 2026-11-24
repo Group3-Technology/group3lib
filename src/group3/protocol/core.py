@@ -105,6 +105,10 @@ def _command_returned_error(command: str, raw: bytes) -> ProtocolError:
 # a tight loop of setter calls.
 DEFAULT_SETTER_ERROR_WINDOW: float = 0.05
 
+# How long to keep reading for a newer reply after a timeout. On the bench the
+# reply to the next command followed the late one by about 30 ms.
+_LATE_REPLY_WINDOW_S: float = 0.2
+
 
 class Group3Protocol:
     """Encoded, terminator-aware request/reply layer over a :class:`Transport`."""
@@ -157,6 +161,8 @@ class Group3Protocol:
         #:   command comes back twice.
         self.expect_command_returned = expect_command_returned
         self._last = _LastExchange()
+        # Set by a request that timed out: its reply may still be on the way.
+        self._reply_may_be_late = False
         # Accumulates write_only payloads (e.g., G3CL ``An`` prefixes) so that
         # ``last_raw_tx`` after a subsequent ``send`` reflects everything that
         # went on the wire since the previous reply, not just the final command.
@@ -234,7 +240,7 @@ class Group3Protocol:
         # reply parses as an error.
         full_tx = bytes(self._pending_tx) + payload
         try:
-            raw = self.transport.request(payload, timeout=_remaining())
+            raw = self._request(payload, full_tx, _remaining())
         except BaseException:
             # Record the attempted TX so callers inspecting last_raw_tx after
             # catching the exception can see exactly what went on the wire.
@@ -693,14 +699,14 @@ class Group3Protocol:
                 return None
             return max(0.0, deadline - time.monotonic())
 
+        # Ctrl-U restarts the instrument, so the banner is its answer.
+        allow_banner = payload == commands.CTRL_U
         try:
-            raw = self.transport.request(payload, timeout=_remaining())
+            raw = self._request(payload, payload, _remaining(), allow_banner=allow_banner)
         except BaseException:
             self._last = _LastExchange(tx=payload, rx=b"")
             raise
         accumulated_rx = bytearray(raw)
-        # Ctrl-U restarts the instrument, so the banner is its answer.
-        allow_banner = payload == commands.CTRL_U
         self._received(payload, raw, allow_banner=allow_banner)
 
         # Detect or enforce echoed prefix. Control-byte commands have no
@@ -739,6 +745,36 @@ class Group3Protocol:
         reply = codec.strip_terminators(codec.decode(raw))
         check_error(reply)
         return reply
+
+    def _request(
+        self,
+        payload: bytes,
+        tx: bytes,
+        timeout: float | None,
+        *,
+        allow_banner: bool = False,
+    ) -> bytes:
+        """Write ``payload`` and return the first reply frame.
+
+        After a request has timed out, its reply can arrive in the next
+        request's window. The device answers in order, so read on until the
+        link is quiet and keep the newest reply; each one passed over still
+        goes through :meth:`_received`, so a late banner is reported.
+        """
+        try:
+            raw = self.transport.request(payload, timeout=timeout)
+        except Group3TimeoutError:
+            self._reply_may_be_late = True
+            raise
+        if not self._reply_may_be_late:
+            return raw
+        self._reply_may_be_late = False
+        while frame := self.transport.read_optional(_LATE_REPLY_WINDOW_S):
+            if codec.strip_terminators(codec.decode(frame)) == "":
+                continue
+            self._received(tx, raw, allow_banner=allow_banner)
+            raw = frame
+        return raw
 
     def _received(self, tx: bytes, rx: bytes, *, allow_banner: bool = False) -> None:
         """Record an exchange for the debug accessors, then refuse a boot banner.

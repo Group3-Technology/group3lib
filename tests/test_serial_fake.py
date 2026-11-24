@@ -10,6 +10,7 @@ import pytest
 
 from group3 import (
     DeviceOverflowError,
+    DeviceRestartedError,
     FakeTransport,
     Group3Protocol,
     NoProbeError,
@@ -177,6 +178,53 @@ class TestStaleInputBeforeWrite:
         p = Group3Protocol(fake)
         p.send_no_reply("SM0")
         assert p.drain_pending() == [b" 1.2345T\n\r"]
+
+
+class TestLateReplyAfterTimeout:
+    """A reply that arrives after its request timed out (issue #18).
+
+    Measured on the bench after a restart: the first F was answered 1.33 s
+    after it was sent, against a 1.0 s timeout, and the retry's own reply
+    followed about 30 ms behind it. The device answers in order, so the
+    newest reply is the one to the latest command.
+    """
+
+    def test_next_command_gets_its_own_reply(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_error(TimeoutError("Timed out after 1.0s with no reply"))
+        for frame in (b" 1.86\n", b"\r", b"\n", b" 1.90\n", b"\r", b"\n"):
+            fake.queue_reply(frame)
+        p = Group3Protocol(fake)
+        with pytest.raises(TimeoutError):
+            p.send("F")
+        assert p.send("F") == " 1.90"
+        fake.queue_reply(b" 21.00C\n")
+        assert p.send("T") == " 21.00C"
+
+    def test_no_late_reply_costs_nothing_but_the_wait(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_error(TimeoutError("Timed out after 1.0s with no reply"))
+        fake.queue_reply(b" 1.90\n")
+        p = Group3Protocol(fake)
+        with pytest.raises(TimeoutError):
+            p.send("F")
+        assert p.send("F") == " 1.90"
+        fake.queue_reply(b" 21.00C\n")
+        assert p.send("T") == " 21.00C"
+
+    def test_a_late_banner_reports_the_restart(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_error(TimeoutError("Timed out after 1.0s with no reply"))
+        fake.queue_reply(b" GROUP 3 DTMS  7.10\r")
+        fake.queue_reply(b" 1.90\n")
+        p = Group3Protocol(fake)
+        with pytest.raises(TimeoutError):
+            p.send("F")
+        with pytest.raises(DeviceRestartedError):
+            p.send("F")
 
 
 class TestSendSetter:

@@ -453,6 +453,12 @@ Other inherited assumptions worth confirming on your unit's DIP-switch settings
   configuration. Manual §3.6 only documents 1- and 2-byte forms; the
   transport drains all consecutive terminator bytes after the first to
   cover any combination transparently.
+- **A restarting instrument can answer after the timeout.** After a `Ctrl-U`
+  the first `F` was answered 1.33 s after it was sent, against a 1.0 s
+  timeout, with the retry's own reply about 30 ms behind it. After a timeout
+  the next request reads on until the link is quiet and returns the newest
+  reply — the device answers in order — so a late reply is never handed to a
+  later command. That first request after a timeout costs up to 0.2 s more.
 
 ## Layer diagram
 
