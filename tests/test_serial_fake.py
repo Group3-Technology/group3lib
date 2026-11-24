@@ -339,6 +339,7 @@ class TestLateReplyAfterTimeout:
         with pytest.raises(TimeoutError):
             p.send("F")
         fake.queue_reply(b" 1.86\r")
+        fake.queue_reply(b"\n")  # a setter that read on would take this ack and pass
         with pytest.raises(ProtocolError, match="Unexpected reply"):
             p.send_setter("SU1")
 
