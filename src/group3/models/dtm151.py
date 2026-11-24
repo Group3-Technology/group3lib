@@ -61,6 +61,8 @@ class _ProtocolLike(Protocol):
     def send(self, command: str, timeout: float | None = None) -> str: ...
     def send_no_reply(self, command: str) -> None: ...
     def send_setter(self, command: str) -> None: ...
+    @property
+    def last_raw_rx(self) -> bytes: ...
 
 
 # Default wait time between ``V`` (trigger) and ``F`` (read) per manual section 4.7.3.
@@ -519,7 +521,10 @@ class DTM151Serial:
         reply = self._protocol.send(commands.IR)
         value = parse_int(reply)
         if not 0 <= value <= 3:
-            raise ProtocolError(f"device reported out-of-range index {value} for IR")
+            raise ProtocolError(
+                f"device reported out-of-range index {value} for IR",
+                raw=self._protocol.last_raw_rx,
+            )
         return value
 
     def set_range(self, index: int) -> None:
