@@ -108,6 +108,9 @@ DEFAULT_SETTER_ERROR_WINDOW: float = 0.05
 # How long to keep reading for a newer reply after a timeout. On the bench the
 # reply to the next command followed the late one by about 30 ms.
 _LATE_REPLY_WINDOW_S: float = 0.2
+# A late reply and the newer one, each with its terminator residue, are six
+# frames; the cap stops a streaming instrument holding the request open.
+_LATE_REPLY_MAX_FRAMES: int = 10
 
 
 class Group3Protocol:
@@ -754,7 +757,7 @@ class Group3Protocol:
         *,
         allow_banner: bool = False,
     ) -> bytes:
-        """Write ``payload`` and return the first reply frame.
+        """Write ``payload`` and return its reply frame.
 
         After a request has timed out, its reply can arrive in the next
         request's window. The device answers in order, so read on until the
@@ -769,7 +772,10 @@ class Group3Protocol:
         if not self._reply_may_be_late:
             return raw
         self._reply_may_be_late = False
-        while frame := self.transport.read_optional(_LATE_REPLY_WINDOW_S):
+        for _ in range(_LATE_REPLY_MAX_FRAMES):
+            frame = self.transport.read_optional(_LATE_REPLY_WINDOW_S)
+            if not frame:
+                break
             if codec.strip_terminators(codec.decode(frame)) == "":
                 continue
             self._received(tx, raw, allow_banner=allow_banner)

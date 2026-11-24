@@ -214,6 +214,18 @@ class TestLateReplyAfterTimeout:
         fake.queue_reply(b" 21.00C\n")
         assert p.send("T") == " 21.00C"
 
+    def test_a_stream_after_a_timeout_does_not_hold_the_request(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_error(TimeoutError("Timed out after 1.0s with no reply"))
+        for _ in range(100):
+            fake.queue_reply(b" 1.90G\n\r")
+        p = Group3Protocol(fake)
+        with pytest.raises(TimeoutError):
+            p.send("F")
+        assert p.send("F") == " 1.90G"
+        assert fake.read_optional(0.0) != b""
+
     def test_a_late_banner_reports_the_restart(self) -> None:
         fake = FakeTransport()
         fake.open()
