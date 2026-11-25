@@ -144,6 +144,40 @@ requests goes unreported. If your results depend on the instrument's settings,
 also check the evidence in each reply — for example that `reading.unit` is the
 unit you set.
 
+### Replies that arrive after a timeout
+
+A request can time out while its reply is still on the way — a restarting
+instrument has answered 1.33 s after a 1.0 s timeout. That reply then arrives
+in the next request's window. So on a point-to-point link the first query after
+a timeout — `send()` or `send_control()`, whichever part of it timed out —
+reads on while frames keep coming (each wait 0.2 s, at most ten frames) and
+returns the newest reply: the device answers in order, so the newest is the
+latest command's. Where commands come back on the wire, the reply runs from the
+last returned copy of the command. `last_raw_rx` holds every frame read, and a
+boot banner among them raises `DeviceRestartedError`.
+
+This holds while the latest command's reply follows the late one within
+0.2 s. If it comes later, or never (the instrument may drop a command while it
+boots), that first query can return the earlier command's reply. Check the
+evidence in each reply where it matters — the unit symbol of a reading, the `C`
+of a temperature; `get_range()` raises `ProtocolError` for an index outside
+0–3.
+
+Setters do not read on. A late reply that arrives in a setter's ack window is
+read as its ack, so the setter raises: `DeviceRestartedError` for the banner,
+otherwise `ProtocolError`, or on a plain link the matching `DeviceError` for an
+error string. A late reply that arrives after that window is passed over by the
+next query.
+
+On a G3CL multi-drop session (`AddressedProtocol`) the address command's ack is
+read before the query, so a late reading there raises `ProtocolError` (an
+error string, its `DeviceError`); the addressed query after it reads on as
+above. A stream (`read_next`) does not
+read on after a timeout; leaving the stream discards pending input.
+
+The first query after a timeout takes at least 0.2 s longer, up to about 2 s
+while frames keep coming.
+
 ### Fiber-optic (FTR) and echo-enabled links
 
 On a fiber-optic link the host sits on a Group3 Communication Loop, and the loop
@@ -453,6 +487,9 @@ Other inherited assumptions worth confirming on your unit's DIP-switch settings
   configuration. Manual §3.6 only documents 1- and 2-byte forms; the
   transport drains all consecutive terminator bytes after the first to
   cover any combination transparently.
+- **A restarting instrument can answer after the timeout.** After a `Ctrl-U`
+  the first `F` was answered 1.33 s after it was sent, against a 1.0 s
+  timeout, and the retry's own reply followed about 30 ms behind it.
 
 ## Layer diagram
 

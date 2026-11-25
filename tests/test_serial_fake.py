@@ -10,6 +10,7 @@ import pytest
 
 from group3 import (
     DeviceOverflowError,
+    DeviceRestartedError,
     FakeTransport,
     Group3Protocol,
     NoProbeError,
@@ -177,6 +178,193 @@ class TestStaleInputBeforeWrite:
         p = Group3Protocol(fake)
         p.send_no_reply("SM0")
         assert p.drain_pending() == [b" 1.2345T\n\r"]
+
+
+class TestLateReplyAfterTimeout:
+    """A reply that arrives after its request timed out (issue #18).
+
+    Measured on the bench after a restart: the first F was answered 1.33 s
+    after it was sent, against a 1.0 s timeout, and the retry's own reply
+    followed about 30 ms behind it. The device answers in order, so the
+    newest reply is the one to the latest command.
+    """
+
+    def test_next_command_gets_its_own_reply(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_error(TimeoutError("Timed out after 1.0s with no reply"))
+        for frame in (b" 1.86\n", b"\r", b"\n", b" 1.90\n", b"\r", b"\n"):
+            fake.queue_reply(frame)
+        p = Group3Protocol(fake)
+        with pytest.raises(TimeoutError):
+            p.send("F")
+        assert p.send("F") == " 1.90"
+        fake.queue_reply(b" 21.00C\n")
+        assert p.send("T") == " 21.00C"
+
+    def test_the_passed_over_frames_stay_in_last_raw_rx(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_error(TimeoutError("Timed out after 1.0s with no reply"))
+        fake.queue_reply(b" 1.86\n")
+        fake.queue_reply(b" 1.90\n")
+        p = Group3Protocol(fake)
+        with pytest.raises(TimeoutError):
+            p.send("F")
+        p.send("F")
+        assert p.last_raw_rx == b" 1.86\n 1.90\n"
+
+    def test_only_the_first_request_after_a_timeout_reads_on(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_error(TimeoutError("Timed out after 1.0s with no reply"))
+        fake.queue_reply(b" 1.90\n")
+        p = Group3Protocol(fake)
+        with pytest.raises(TimeoutError):
+            p.send("F")
+        assert p.send("F") == " 1.90"
+        fake.queue_reply(b" 21.00C\n")
+        fake.queue_reply(b" 1.91\n")
+        assert p.send("T") == " 21.00C"
+        assert fake.read_optional(0.0) == b" 1.91\n"
+
+    def test_a_normal_request_does_not_read_on(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_reply(b" 1.90\n")
+        fake.queue_reply(b" 1.91\n")
+        p = Group3Protocol(fake)
+        assert p.send("F") == " 1.90"
+        assert fake.read_optional(0.0) == b" 1.91\n"
+
+    def test_a_stream_after_a_timeout_does_not_hold_the_request(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_error(TimeoutError("Timed out after 1.0s with no reply"))
+        for _ in range(100):
+            fake.queue_reply(b" 1.90G\n\r")
+        p = Group3Protocol(fake)
+        with pytest.raises(TimeoutError):
+            p.send("F")
+        assert p.send("F") == " 1.90G"
+        assert fake.read_optional(0.0) != b""
+
+    def test_a_passed_over_banner_reports_the_restart(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_error(TimeoutError("Timed out after 1.0s with no reply"))
+        fake.queue_reply(b" GROUP 3 DTMS  7.10\r")
+        fake.queue_reply(b" 1.90\n")
+        p = Group3Protocol(fake)
+        with pytest.raises(TimeoutError):
+            p.send("F")
+        with pytest.raises(DeviceRestartedError):
+            p.send("F")
+
+    def test_a_loop_link_keeps_the_returned_command_and_its_reply(self) -> None:
+        """On a G3CL loop the command comes back as its own frame first."""
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_error(TimeoutError("Timed out after 1.0s with no reply"))
+        for frame in (b" 1.86\r", b"F\r", b" 1.90\r"):
+            fake.queue_reply(frame)
+        p = Group3Protocol(fake, expect_command_returned=True)
+        with pytest.raises(TimeoutError):
+            p.send("F")
+        assert p.send("F") == " 1.90"
+
+    def test_an_echo_link_keeps_the_echo_and_its_reply(self) -> None:
+        """With S2-4 echo the command comes back glued to its reply."""
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_error(TimeoutError("Timed out after 1.0s with no reply"))
+        fake.queue_reply(b" 1.86\r")
+        fake.queue_reply(b"F 1.90\r")
+        p = Group3Protocol(fake, expect_command_returned=True)
+        with pytest.raises(TimeoutError):
+            p.send("F")
+        assert p.send("F") == " 1.90"
+
+    def test_a_loop_link_without_a_late_reply(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_error(TimeoutError("Timed out after 1.0s with no reply"))
+        fake.queue_reply(b"F\r")
+        fake.queue_reply(b" 1.90\r")
+        p = Group3Protocol(fake, expect_command_returned=True)
+        with pytest.raises(TimeoutError):
+            p.send("F")
+        assert p.send("F") == " 1.90"
+
+    def test_a_timeout_reading_on_for_the_loop_reply_counts_too(self) -> None:
+        """The returned command arrived, its reply did not: send's own read timed out."""
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_reply(b"F\r")
+        p = Group3Protocol(fake, expect_command_returned=True)
+        with pytest.raises(TimeoutError):
+            p.send("F")
+        for frame in (b" 1.86\r", b"F\r", b" 1.90\r"):
+            fake.queue_reply(frame)
+        assert p.send("F") == " 1.90"
+
+    def test_a_timeout_draining_residue_counts_too(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_reply(b"\r")
+        p = Group3Protocol(fake)
+        with pytest.raises(TimeoutError):
+            p.send("F")
+        fake.queue_reply(b" 1.86\r")
+        fake.queue_reply(b" 1.90\r")
+        assert p.send("F") == " 1.90"
+
+    def test_a_timeout_reading_on_after_a_returned_control_counts_too(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_reply(b"\x04")
+        p = Group3Protocol(fake)
+        with pytest.raises(TimeoutError):
+            p.send_control(b"\x04", expect_echo=True)
+        fake.queue_reply(b" 1.86\r")
+        fake.queue_reply(b" 1.90\r")
+        assert p.send("F") == " 1.90"
+
+    def test_a_setter_after_a_timeout_does_not_read_on(self) -> None:
+        """Only queries read on; a late reading in a setter's window is a desync."""
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_error(TimeoutError("Timed out after 1.0s with no reply"))
+        p = Group3Protocol(fake)
+        with pytest.raises(TimeoutError):
+            p.send("F")
+        fake.queue_reply(b" 1.86\r")
+        fake.queue_reply(b"\n")  # a setter that read on would take this ack and pass
+        with pytest.raises(ProtocolError, match="Unexpected reply"):
+            p.send_setter("SU1")
+
+    def test_ctrl_u_after_a_timeout_takes_the_banner_past_a_late_reply(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_error(TimeoutError("Timed out after 1.0s with no reply"))
+        fake.queue_reply(b" 1.86\r")
+        fake.queue_reply(b" GROUP 3 DTMS  7.10\r")
+        p = Group3Protocol(fake)
+        with pytest.raises(TimeoutError):
+            p.send("F")
+        assert "GROUP 3 DTMS" in p.send_control(b"\x15", expect_echo=False)
+
+    def test_another_control_after_a_timeout_reports_a_passed_over_banner(self) -> None:
+        fake = FakeTransport()
+        fake.open()
+        fake.queue_error(TimeoutError("Timed out after 1.0s with no reply"))
+        fake.queue_reply(b" GROUP 3 DTMS  7.10\r")
+        fake.queue_reply(b" 0101 0110 0000 0000 \r")
+        p = Group3Protocol(fake)
+        with pytest.raises(TimeoutError):
+            p.send("F")
+        with pytest.raises(DeviceRestartedError):
+            p.send_control(b"\x04", expect_echo=False)
 
 
 class TestSendSetter:
